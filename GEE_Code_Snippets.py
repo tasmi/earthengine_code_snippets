@@ -113,8 +113,8 @@ def Rolling_LinearFit(collection, windowSize=17):
         fit = window.select(['time',bn]).reduce(ee.Reducer.linearFit())
     
         #Use the helper function to apply the piecewise linear fits to the original data
-        #Forcing it to a list drops any empty images, the number of elements kept helps keep memory usage down
-        out = window.map(applyFit).toList(5)
+        #Forcing it to a list drops any empty images
+        out = window.map(applyFit).toList(data.size())
         return out
 
     #function to reduce time stacked linear regression results
