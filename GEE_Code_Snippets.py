@@ -473,6 +473,32 @@ def join_timeagg_collections(c1, c2):
     joined_collect = ee.ImageCollection(innerJoined.map(combine_joined))
     return joined_collect
 
+def two_band_reg(c1, c2, crs, name, scale=30):
+    #https://developers.google.com/earth-engine/joins_simple
+    filt = ee.Filter.equals(leftField='system:index', rightField='system:index') #system:time_start will also work if the collections are different time lengths
+    innerJoin = ee.Join.inner() #initialize the join
+    innerJoined = innerJoin.apply(c1, c2, filt) #This is a FEATURE COLLECTION
+    def combine_joined(feature):
+        return ee.Image.cat(feature.get('primary'), feature.get('secondary'))
+    
+    joined_collect = ee.ImageCollection(innerJoined.map(combine_joined))
+    
+    #Get the band names
+    bn1 = c1.first().bandNames().get(0)
+    bn2 = c2.first().bandNames().get(0)
+        
+    #Add a constant band
+    def createConstantBand(image):
+        return ee.Image(1).addBands(image)
+    
+    prepped = joined_collect.map(createConstantBand)
+        
+    #Now using that joined collection, do a regression
+    #fit = prepped.select(['constant', bn1, bn2]).reduce(ee.Reducer.linearRegression(numX=2, numY=1))
+    fit = prepped.select(['constant', bn1, bn2]).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
+    lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']]).select('trend')
+    return lrImage
+
 #%% Data Import and Cleaning Functions
 ### GPM
 def mask_GPM(image):
