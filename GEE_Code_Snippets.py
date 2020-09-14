@@ -23,10 +23,17 @@ def gee_geometry_from_shapely(geom, ty='Polygon', crs='epsg:4326'):
     Google Earth Engine Geometry.
     """
     from shapely.geometry import mapping
+    #ty = geom.type
     if ty == 'Polygon':
         return ee.Geometry.Polygon(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)
     elif ty == 'Point':
-        return ee.Geometry.Point(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)
+        return ee.Geometry.Point(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)    
+    elif ty == 'MultiPolygon':
+        return ee.Geometry.MultiPolygon(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)
+    
+def customRemap(image, lowerLimit, upperLimit, newValue):
+    mask = image.gt(lowerLimit).And(image.lte(upperLimit))
+    return image.where(mask, newValue)
 
 #%% Time Series Functions
 def detrend(collection, return_detrend=False):
@@ -393,11 +400,19 @@ def aggregate_to_monthly(collection, ds, de, agg_fx='sum'):
         daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
         return daymn
     
+    def reduceSTD(t):
+        t = ee.Date(t)
+        filt_coll = collection.filterDate(t, t.advance(1, 'month'))
+        daymn = filt_coll.reduce(ee.Reducer.stdDev()).set('system:time_start', t.millis()).rename(bn)
+        return daymn
+    
     #Map over the list of months, return either a mean or a sum of those values
     if agg_fx == 'sum':
         mo_agg = dates.map(reduceSum)
     elif agg_fx == 'mean':
         mo_agg = dates.map(reduceMean)
+    elif agg_fx == 'std':
+        mo_agg = dates.map(reduceSTD)
         
     #Convert back into an image collection
     monthly = ee.ImageCollection.fromImages(mo_agg)
@@ -446,6 +461,17 @@ def create_anomalies(collection, ds, de):
     #Subtract the lont-term mean from each value
     anoms = coll_yearly.map(mapped_subtract)
     return anoms
+
+#%% Join Collections
+def join_timeagg_collections(c1, c2):
+    filt = ee.Filter.equals(leftField='system:index', rightField='system:index') #system:time_start will also work if the collections are different time lengths
+    innerJoin = ee.Join.inner() #initialize the join
+    innerJoined = innerJoin.apply(c1, c2, filt) #This is a FEATURE COLLECTION
+    def combine_joined(feature):
+        return ee.Image.cat(feature.get('primary'), feature.get('secondary'))
+    
+    joined_collect = ee.ImageCollection(innerJoined.map(combine_joined))
+    return joined_collect
 
 #%% Data Import and Cleaning Functions
 ### GPM
@@ -510,6 +536,9 @@ def maskS2clouds(image):
     mask = qa.bitwiseAnd(cloudBitMask).eq(0).And(qa.bitwiseAnd(cirrusBitMask).eq(0))
     return image.updateMask(mask).divide(10000).set('system:time_start', image.get('system:time_start'))
 
+def rescale_modis(image):
+    return image.multiply(0.0001).set('system:time_start', image.get('system:time_start'))
+
 #%% Conversion to Python Time Series
 def export_to_pandas(collection, clipper, aggregation_scale, save=None):
     '''
@@ -560,21 +589,23 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None):
         print(save)
     return ser, serstd
 
-#%% Short Example
-minx2, maxx2 = 18, 20
-miny2, maxy2 = -20, -18
-from shapely.geometry import Polygon
-geom = Polygon([[minx2, maxy2], [maxx2, maxy2], [maxx2, miny2], [minx2, miny2]])
 
-search_area = gee_geometry_from_shapely(geom)
 
-L8 = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR").filter(ee.Filter.date('2013-01-01', '2020-01-01'))\
-    .filterBounds(search_area)\
-    .filter(ee.Filter.lt('CLOUD_COVER', 15))\
-    .map(maskL8sr)\
-    .sort('system:time_start')
+# #%% Short Example
+# minx2, maxx2 = 18, 20
+# miny2, maxy2 = -20, -18
+# from shapely.geometry import Polygon
+# geom = Polygon([[minx2, maxy2], [maxx2, maxy2], [maxx2, miny2], [minx2, miny2]])
 
-NDVI = L8.map(NDVI_L8).select('NDVI')
+# search_area = gee_geometry_from_shapely(geom)
 
-harmonic, phase, amplitude, rsq = fit_multi_harmonic(detrend(NDVI), 5)
-run_export(phase, 'epsg:4326', 'Landsat8_HarmonicPhase', scale=30, region=search_area, maxPixels=1e12)
+# L8 = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR").filter(ee.Filter.date('2013-01-01', '2020-01-01'))\
+#     .filterBounds(search_area)\
+#     .filter(ee.Filter.lt('CLOUD_COVER', 15))\
+#     .map(maskL8sr)\
+#     .sort('system:time_start')
+
+# NDVI = L8.map(NDVI_L8).select('NDVI')
+
+# harmonic, phase, amplitude, rsq = fit_multi_harmonic(detrend(NDVI), 5)
+# run_export(phase, 'epsg:4326', 'Landsat8_HarmonicPhase', scale=30, region=search_area, maxPixels=1e12)
