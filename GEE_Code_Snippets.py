@@ -36,6 +36,23 @@ def customRemap(image, lowerLimit, upperLimit, newValue):
     return image.where(mask, newValue)
 
 #%% Time Series Functions
+def prevdif(collection):
+    ''' 
+    Get the simple time difference between sequential images in an image collection.
+    NOTE: It is important to do a tight spatial filtering first!
+    '''
+    def dif(f):
+        #sdate = ee.Date(ee.Image(ee.List(f).get(0)).get('system:time_start'))
+        f = ee.Number(f)
+        edate = ee.Date(ee.Image(ic_list.get(f)).get('system:time_start'))
+        return ee.Image(ic_list.get(f.add(1))).subtract(ee.Image(ic_list.get(f))).set('system:time_start', edate)
+    
+    ic_list = collection.sort('system:time_start').toList(collection.size())
+    seq = ee.List.sequence(0, collection.size().subtract(2)) #Drop the final image since we don't have the next to subtract
+    ic_diff = seq.map(dif)
+    
+    return ee.ImageCollection.fromImages(ic_diff)
+
 def detrend(collection, return_detrend=False):
     """ 
     Simple linear detrender to center a dataset around mean zero with no linear trend.
