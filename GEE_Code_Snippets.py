@@ -17,13 +17,13 @@ def run_export(image, crs, filename, scale, region, maxPixels=1e12):
     task = ee.batch.Export.image.toDrive(image, filename, **task_config)
     task.start()
 
-def gee_geometry_from_shapely(geom, ty='Polygon', crs='epsg:4326'):
+def gee_geometry_from_shapely(geom, crs='epsg:4326'):
     """ 
     Simple helper function to take a shapely geometry and a coordinate system and convert them to a 
     Google Earth Engine Geometry.
     """
     from shapely.geometry import mapping
-    #ty = geom.type
+    ty = geom.type
     if ty == 'Polygon':
         return ee.Geometry.Polygon(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)
     elif ty == 'Point':
@@ -565,6 +565,67 @@ def maskS2clouds(image):
 def rescale_modis(image):
     return image.multiply(0.0001).set('system:time_start', image.get('system:time_start'))
 
+#%% Online Filtering
+def apply_SG(collect, geom, window_size=7, imageAxis=0, bandAxis=1, order=3):
+    '''
+    Apply a Savitzky-Golay filter to a time series collection (pixelwise)
+
+    '''
+    def prep_SG(img):
+        #Add predictors for SG fitting, using date difference
+        #We prepare for order 3 fitting, but can be adapted to lower order fitting later on
+        dstamp = ee.Date(img.get('system:time_start'))
+        ddiff = dstamp.difference(ee.Date(ds), 'hour')
+        return img.addBands(ee.Image(1).toFloat().rename('constant'))\
+        .addBands(ee.Image(ddiff).toFloat().rename('t'))\
+        .addBands(ee.Image(ddiff).pow(ee.Image(2)).toFloat().rename('t2'))\
+        .addBands(ee.Image(ddiff).pow(ee.Image(3)).toFloat().rename('t3'))\
+        .set('date', dstamp)
+    
+    def getLocalFit(i):
+        #Get a slice corresponding to the window_size of the SG smoother
+        subarray = array.arraySlice(imageAxis, ee.Number(i).int(), ee.Number(i).add(window_size).int())
+        #predictors = subarray.arraySlice(bandAxis, 2, 2 + order + 1)
+        predictors = subarray.arraySlice(bandAxis, 1, 1 + order + 1) #Here for a one-variable case
+        response = subarray.arraySlice(bandAxis, 0, 1)
+        coeff = predictors.matrixSolve(response)
+        
+        coeff = coeff.arrayProject([0]).arrayFlatten(coeffFlattener)
+        return coeff 
+    
+    def apply_SG_sub(i):
+        ref = ee.Image(c.get(ee.Number(i).add(ee.Number(half_window))))
+        return getLocalFit(i).multiply(ref.select(indepSelectors)).reduce(ee.Reducer.sum()).copyProperties(ref)
+    
+    half_window = (window_size - 1)/2
+    if order == 3:
+        coeffFlattener = [['constant', 'x', 'x2', 'x3']]
+        indepSelectors = ['constant', 't', 't2', 't3']
+    elif order == 2:
+        coeffFlattener = [['constant', 'x', 'x2']]
+        indepSelectors = ['constant', 't', 't2']
+        
+    collect_coeffs = collect.map(prep_SG)
+    array = collect_coeffs.toArray() #THIS STEP IS EXPENSIVE
+    c = collect_coeffs.toList(collect_coeffs.size())
+    runLength = ee.List.sequence(0, c.size().subtract(window_size))
+    
+    sg_series = runLength.map(apply_SG_sub)
+    
+    #Drop the null values
+    sg_sliced = sg_series.slice(half_window, sg_series.size().subtract(half_window))
+    sg_series = ee.ImageCollection.fromImages(sg_sliced)
+    
+    def minmax(img):
+        #Map reducer to get global min/max NDVI (for filtering purposes)
+        bn = img.bandNames().get(0)
+        minMax =  img.reduceRegion(ee.Reducer.minMax(), geom, 1000)
+        return img.set({'roi_min': minMax.get(ee.String(bn).cat('_min')),'roi_max': minMax.get(ee.String(bn).cat('_max'))}).set('date', img.get('date'))
+    
+    sg = sg_series.map(minmax)                    
+    
+    return sg.filterMetadata('roi_min', 'not_equals', None).filterMetadata('roi_max', 'not_equals', None)
+
 #%% Conversion to Python Time Series
 def export_to_pandas(collection, clipper, aggregation_scale, save=None):
     '''
@@ -585,7 +646,7 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None):
         ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mean': value, 'STD': std})
         return ft
     
-    TS = collection.map(createTS)
+    TS = collection.filterBounds(clipper).map(createTS)
     dump = TS.getInfo()
     fts = dump['features']
     out_vals = np.empty((len(fts)))
