@@ -35,6 +35,14 @@ def customRemap(image, lowerLimit, upperLimit, newValue):
     mask = image.gt(lowerLimit).And(image.lte(upperLimit))
     return image.where(mask, newValue)
 
+def remove_null(collection):
+    '''
+    Remove empty images from a collection
+    '''
+    def flag_null(image):
+        return image.set('band_count', image.bandNames().length())
+    return collection.map(flag_null).filter(ee.Filter.gt('band_count', 0))
+
 #%% Time Series Functions
 def prevdif(collection):
     ''' 
@@ -382,14 +390,14 @@ def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
         pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
-        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn.cat('_p75')).subtract(pcts.select(bn.cat('_p25'))).toFloat().set('system:time_start', t.millis()).rename(bn)
         return iqr
     
     def reduce9010(t):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
         pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
-        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn.cat('_p90')).subtract(pcts.select(bn.cat('_p10'))).toFloat().set('system:time_start', t.millis()).rename(bn)
         return iqr
     
     if agg_fx == 'sum':
@@ -408,7 +416,7 @@ def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
 
 def aggregate_to_monthly(collection, ds, de, agg_fx='sum'):
     '''
-    Take an ImageCollection and convert it into a summed or average monthly value
+    Take an ImageCollection and convert it into a monthly value
     '''
     start, end = ee.Date(ds), ee.Date(de)
     #Generate length of months to look through
@@ -538,9 +546,33 @@ def create_anomalies(collection, ds, de):
     anoms = coll_yearly.map(mapped_subtract)
     return anoms
 
+def seasonal_composite(monthly, season):
+    '''
+    Break out seasonal slices of a collection
+    '''
+    allfilts = []
+    if season == 'DJF':
+        for m in [12, 1, 2]:
+            allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
+        filt = ee.Filter.Or(allfilts)
+    if season == 'MAM':
+        for m in [3, 4, 5]:
+            allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
+        filt = ee.Filter.Or(allfilts)
+    if season == 'JJA':
+        for m in [6, 7, 8]:
+            allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
+        filt = ee.Filter.Or(allfilts)
+    if season == 'SON':
+        for m in [9, 10, 11]:
+            allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
+        filt = ee.Filter.Or(allfilts)
+    return monthly.filter(filt)
+
 #%% Join Collections
 def join_timeagg_collections(c1, c2):
-    filt = ee.Filter.equals(leftField='system:index', rightField='system:index') #system:time_start will also work if the collections are different time lengths
+    filt = ee.Filter.equals(leftField='system:time_start', rightField='system:time_start') 
+    #filt = ee.Filter.equals(leftField='system:index', rightField='system:index') 
     innerJoin = ee.Join.inner() #initialize the join
     innerJoined = innerJoin.apply(c1, c2, filt) #This is a FEATURE COLLECTION
     def combine_joined(feature):
@@ -549,9 +581,10 @@ def join_timeagg_collections(c1, c2):
     joined_collect = ee.ImageCollection(innerJoined.map(combine_joined))
     return joined_collect
 
-def two_band_reg(c1, c2, crs, name, scale=30):
+def two_band_reg(c1, c2, crs, name, polygon, scale=30):
     #https://developers.google.com/earth-engine/joins_simple
-    filt = ee.Filter.equals(leftField='system:index', rightField='system:index') #system:time_start will also work if the collections are different time lengths
+    filt = ee.Filter.equals(leftField='system:time_start', rightField='system:time_start') 
+    #filt = ee.Filter.equals(leftField='system:index', rightField='system:index')     
     innerJoin = ee.Join.inner() #initialize the join
     innerJoined = innerJoin.apply(c1, c2, filt) #This is a FEATURE COLLECTION
     def combine_joined(feature):
@@ -572,7 +605,7 @@ def two_band_reg(c1, c2, crs, name, scale=30):
     #Filter to make sure only images with both bands are used
     #f1 = ee.Filter.listContains('bands', bn1)
     #f2 = ee.Filter.listContains('bands', bn2)
-    #filt = prepped.filter(ee.Filter.Or([f1, f2]))
+    #filt = prepped.filter(ee.Filter.And([f1, f2]))
     #filt = prepped.filterMetadata('bandNames','contains',bn1)
     
     #filt = ee.ImageCollection.fromImages(prepped.toList(prepped.size()))
@@ -580,10 +613,11 @@ def two_band_reg(c1, c2, crs, name, scale=30):
     #Now using that joined collection, do a regression
     #fit = prepped.select(['constant', bn1, bn2]).reduce(ee.Reducer.linearRegression(numX=2, numY=1))
     fit = prepped.select(['constant', bn1, bn2]).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
+    #fit = filt.select(['constant', bn1, bn2]).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
     lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']]).select('trend')
-    return lrImage
+    run_export(lrImage, crs, name + '_RobustLinReg', scale, polygon)
 
-def same_inst_twoband_reg(collection, crs, name, scale=30):
+def same_inst_twoband_reg(collection, crs, name, polygon, scale=30):
     bn = collection.first().bandNames()
     
     def createConstantBand(image):
@@ -774,9 +808,44 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None):
         print(save)
     return ser, serstd
 
+def percentile_export(collection, percentile, clipper, aggregation_scale=30, save=None):
+    '''
+    Get a time series at a certain percentile
+    '''
+    
+    import pandas as pd, numpy as np
+    
+    def createTS(image):
+        date = image.get('system:time_start')
+        value = image.reduceRegion(ee.Reducer.percentile([percentile]), clipper, aggregation_scale)
+        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'PCT': value})
+        return ft
+    
+    TS = collection.filterBounds(clipper).map(createTS)
+    dump = TS.getInfo()
+    fts = dump['features']
+    out_vals = np.empty((len(fts)))
+    out_dates = []
+    
+    for i, f in enumerate(fts):
+        props = f['properties']
+        date = props['date']
+        try:
+            val = list(props['PCT'].values())[0]
+        except:
+            val = np.nan
+        out_vals[i] = val
+        out_dates.append(pd.Timestamp(date))
+    
+    ser = pd.Series(out_vals, index=out_dates)
+    if save:
+        df = pd.DataFrame({'p' + str(percentile):out_vals, 'time':out_dates})
+        df.to_csv(save + '.csv', index=False)
+        print(save)
+    return ser
 
 
-# #%% Short Example
+#%% Short Example
 # minx2, maxx2 = 18, 20
 # miny2, maxy2 = -20, -18
 # from shapely.geometry import Polygon
