@@ -383,14 +383,14 @@ def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
         filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
         pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
         iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t.millis()).rename(bn)
-        return dayqr
+        return iqr
     
     def reduce9010(t):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
         pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
         iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t.millis()).rename(bn)
-        return dayqr
+        return iqr
     
     if agg_fx == 'sum':
         yr_agg = dates.map(reduceSum)
