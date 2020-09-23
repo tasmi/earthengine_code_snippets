@@ -374,14 +374,32 @@ def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
     
     def reduceMean(t):
         t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(1, 'month'))
+        filt_coll = collection.filterDate(t, t.advance(1, 'year'))
         daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
         return daymn
+    
+    def reduceIQR(t):
+        t = ee.Date(t)
+        filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
+        pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
+        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        return dayqr
+    
+    def reduce9010(t):
+        t = ee.Date(t)
+        filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
+        pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
+        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        return dayqr
     
     if agg_fx == 'sum':
         yr_agg = dates.map(reduceSum)
     elif agg_fx == 'mean':
         yr_agg = dates.map(reduceMean)
+    elif agg_fx == 'iqr':
+        yr_agg = dates.map(reduceIQR)
+    elif agg_fx == '9010':
+        yr_agg = dates.map(reduce9010)
         
     #Convert back into an image collection
     yearly = ee.ImageCollection.fromImages(yr_agg)
@@ -515,6 +533,20 @@ def two_band_reg(c1, c2, crs, name, scale=30):
     fit = prepped.select(['constant', bn1, bn2]).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
     lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']]).select('trend')
     return lrImage
+
+def same_inst_twoband_reg(collection, crs, name, scale=30):
+    bn = collection.first().bandNames()
+    
+    def createConstantBand(image):
+        return ee.Image(1).addBands(image)
+    
+    prepped = collection.map(createConstantBand)
+    
+    var = ee.List(['constant']).cat(bn)
+    
+    fit = prepped.select(var).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
+    lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']]).select('trend')
+    run_export(lrImage, crs, name + '_RobustLinReg', scale, polygon)
 
 #%% Data Import and Cleaning Functions
 ### GPM
