@@ -351,7 +351,7 @@ def fit_multi_harmonic(collection, harmonics=3):
 #%% Data Aggregation Functions
 def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
     '''
-    Take an ImageCollection and convert it into a summed or average yearly value
+    Take an ImageCollection and convert it into a yearly value
     '''
     start, end = ee.Date(ds), ee.Date(de)
     #Generate list of years
@@ -454,6 +454,47 @@ def aggregate_to_monthly(collection, ds, de, agg_fx='sum'):
     
     return monthly
 
+def aggregate_to_daily(collection, ds, de, dayskip=1, agg_fx='sum'):
+    start, end = ee.Date(ds), ee.Date(de)
+    #Generate days
+    difdate = end.difference(start, 'day')
+    length = ee.List.sequence(0, difdate.subtract(1))
+    
+    if not dayskip == 1:
+        length_py = length.getInfo()
+        length_skip = length_py[::dayskip]
+        length = ee.List(length_skip)
+    
+    def gen_datelist(day):
+        return start.advance(day, 'day')
+    
+    dates = length.map(gen_datelist)
+
+    #Get Band Name
+    bn = collection.first().bandNames().getInfo()[0]
+    
+    def reduceSum(t):
+        t = ee.Date(t)
+        filt_coll = collection.filterDate(t, t.advance(dayskip, 'day'))
+        daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
+        return daysum
+    
+    def reduceMean(t):
+        t = ee.Date(t)
+        filt_coll = collection.filterDate(t, t.advance(dayskip, 'day'))
+        daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
+        return daymn
+    
+    if agg_fx == 'sum':
+        daily_agg = dates.map(reduceSum)
+    elif agg_fx == 'mean':
+        daily_agg = dates.map(reduceMean)
+        
+    #Convert back to Image Collection
+    daily = ee.ImageCollection.fromImages(daily_agg)
+    
+    return daily
+
 def monthly_averages(collection, agg_fx='mean', years=None):
     '''
     Get the long-term average value for each month of the year over an ImageCollection
@@ -527,6 +568,14 @@ def two_band_reg(c1, c2, crs, name, scale=30):
         return ee.Image(1).addBands(image)
     
     prepped = joined_collect.map(createConstantBand)
+    
+    #Filter to make sure only images with both bands are used
+    #f1 = ee.Filter.listContains('bands', bn1)
+    #f2 = ee.Filter.listContains('bands', bn2)
+    #filt = prepped.filter(ee.Filter.Or([f1, f2]))
+    #filt = prepped.filterMetadata('bandNames','contains',bn1)
+    
+    #filt = ee.ImageCollection.fromImages(prepped.toList(prepped.size()))
         
     #Now using that joined collection, do a regression
     #fit = prepped.select(['constant', bn1, bn2]).reduce(ee.Reducer.linearRegression(numX=2, numY=1))
