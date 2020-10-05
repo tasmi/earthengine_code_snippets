@@ -390,14 +390,16 @@ def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
         pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
-        iqr = pcts.select(bn.cat('_p75')).subtract(pcts.select(bn.cat('_p25'))).toFloat().set('system:time_start', t.millis()).rename(bn)
+        #iqr = pcts.select(bn.cat('_p75')).subtract(pcts.select(bn.cat('_p25'))).toFloat().set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t.millis()).rename(bn)
         return iqr
     
     def reduce9010(t):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
         pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
-        iqr = pcts.select(bn.cat('_p90')).subtract(pcts.select(bn.cat('_p10'))).toFloat().set('system:time_start', t.millis()).rename(bn)
+        #iqr = pcts.select(bn.cat('_p90')).subtract(pcts.select(bn.cat('_p10'))).toFloat().set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t.millis()).rename(bn)
         return iqr
     
     if agg_fx == 'sum':
@@ -696,6 +698,98 @@ def maskS2clouds(image):
 
 def rescale_modis(image):
     return image.multiply(0.0001).set('system:time_start', image.get('system:time_start'))
+
+def L8_Temp(image):
+    #Get Fractional Veg
+    ndvi = image.normalizedDifference(['B5', 'B4']).rename('NDVI').select('NDVI')
+    #mm = ndvi.reduceRegion(ee.Reducer.minMax(), polygon, 100)
+    #nmin = ee.Number(mm.get('NDVI_min'))
+    #nmax = ee.Number(mm.get('NDVI_max'))
+    nmin, nmax = ee.Number(0.2), ee.Number(0.5)
+    fv = (ndvi.subtract(nmin).divide(nmax.subtract(nmin))).pow(ee.Number(2)).rename('FV')
+    
+    #Emissivity
+    a = ee.Number(0.004)
+    b = ee.Number(0.986)
+    EM = fv.multiply(a).add(b).rename('EMM')
+    
+    #Calc of LST
+    thermal = image.select('B10').multiply(0.1)
+    LST = thermal.expression('(Tb/(1 + (0.00115* (Tb / 1.438))*log(Ep)))-273.15',\
+                             {'Tb': thermal.select('B10'), \
+                              'Ep': EM.select('EMM')}).rename('LST')
+    return LST.select('LST').set('system:time_start', image.get('system:time_start'))
+
+#%% Convert S1 to DB
+def terrainCorrection(image):
+    import numpy as np
+    #Implementation by Andreas Vollrath (ESA), inspired by Johannes Reiche (Wageningen)
+    #Modified from: https://gis.stackexchange.com/questions/352602/getting-local-incidence-angle-from-sentinel-1-grd-image-collection-in-google-ear
+    imgGeom = image.geometry()
+    srtm = ee.Image('USGS/SRTMGL1_003').clip(imgGeom) # 30m srtm 
+    sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0))
+
+    #Article ( numbers relate to chapters)
+    #2.1.1 Radar geometry 
+    theta_i = image.select('angle')
+    phi_i = ee.Terrain.aspect(theta_i)\
+        .reduceRegion(ee.Reducer.mean(), theta_i.get('system:footprint'), 1000)\
+        .get('aspect')
+
+    #2.1.2 Terrain geometry
+    alpha_s = ee.Terrain.slope(srtm).select('slope')
+    phi_s = ee.Terrain.aspect(srtm).select('aspect')
+
+    #2.1.3 Model geometry
+    #reduce to 3 angle
+    phi_r = ee.Image.constant(phi_i).subtract(phi_s)
+
+    #convert all to radians
+    phi_rRad = phi_r.multiply(np.pi / 180)
+    alpha_sRad = alpha_s.multiply(np.pi / 180)
+    theta_iRad = theta_i.multiply(np.pi / 180)
+    ninetyRad = ee.Image.constant(90).multiply(np.pi / 180)
+
+    #slope steepness in range (eq. 2)
+    alpha_r = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan()
+
+    #slope steepness in azimuth (eq 3)
+    alpha_az = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan()
+
+    #local incidence angle (eq. 4)
+    theta_lia = (alpha_az.cos().multiply((theta_iRad.subtract(alpha_r)).cos())).acos()
+    theta_liaDeg = theta_lia.multiply(180 / np.pi)
+    
+    #2.2 Gamma_nought_flat
+    gamma0 = sigma0Pow.divide(theta_iRad.cos())
+    gamma0dB = ee.Image.constant(10).multiply(gamma0.log10())
+    ratio_1 = gamma0dB.select('VV').subtract(gamma0dB.select('VH'))
+
+    #Volumetric Model
+    nominator = (ninetyRad.subtract(theta_iRad).add(alpha_r)).tan()
+    denominator = (ninetyRad.subtract(theta_iRad)).tan()
+    volModel = (nominator.divide(denominator)).abs()
+
+    #apply model
+    gamma0_Volume = gamma0.divide(volModel)
+    gamma0_VolumeDB = ee.Image.constant(10).multiply(gamma0_Volume.log10())
+
+    #we add a layover/shadow maskto the original implmentation
+    #layover, where slope > radar viewing angle 
+    alpha_rDeg = alpha_r.multiply(180 / np.pi)
+    layover = alpha_rDeg.lt(theta_i)
+
+    #shadow where LIA > 90
+    shadow = theta_liaDeg.lt(85)
+
+    #calculate the ratio for RGB vis
+    ratio = gamma0_VolumeDB.select('VV').subtract(gamma0_VolumeDB.select('VH'))
+
+    output = gamma0_VolumeDB.addBands(ratio).addBands(alpha_r).addBands(phi_s).addBands(theta_iRad)\
+    .addBands(layover).addBands(shadow).addBands(gamma0dB).addBands(ratio_1)
+
+    return image.addBands(output.select(['VV', 'VH', 'slope_1', 'slope_2'], ['VV', 'VH', 'layover', 'shadow']),None, True)
+
 
 #%% Online Filtering
 def apply_SG(collect, geom, window_size=7, imageAxis=0, bandAxis=1, order=3):
