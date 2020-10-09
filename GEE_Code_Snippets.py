@@ -43,6 +43,20 @@ def remove_null(collection):
         return image.set('band_count', image.bandNames().length())
     return collection.map(flag_null).filter(ee.Filter.gt('band_count', 0))
 
+def mask_invalid(collection, minval, maxval, band=None):
+    '''
+    Mask all images in a collection by some min and max value
+    '''
+    
+    if band:
+        collection = collection.select(band)
+    
+    def apply_mask(image):
+        mask1 = image.lt(maxval)
+        mask2 = image.gt(minval)
+        return image.updateMask(mask1).updateMask(mask2)
+    return collection.map(apply_mask)
+
 #%% Time Series Functions
 def prevdif(collection):
     ''' 
@@ -374,42 +388,46 @@ def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
     #Get band name
     bn = collection.first().bandNames().getInfo()[0]
     
-    def reduceSum(t):
+    def create_sub_collections(t):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(1, 'year'))
+        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
+    
+    mc = dates.map(create_sub_collections)
+    mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
+    
+    def reduceSum(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
         daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
         return daysum
     
-    def reduceMean(t):
-        t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(1, 'year'))
+    def reduceMean(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
         daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
         return daymn
     
-    def reduceIQR(t):
-        t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
+    def reduceIQR(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
         pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
         #iqr = pcts.select(bn.cat('_p75')).subtract(pcts.select(bn.cat('_p25'))).toFloat().set('system:time_start', t.millis()).rename(bn)
         iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t.millis()).rename(bn)
         return iqr
     
-    def reduce9010(t):
-        t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(1, 'year'))    
+    def reduce9010(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)  
         pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
         #iqr = pcts.select(bn.cat('_p90')).subtract(pcts.select(bn.cat('_p10'))).toFloat().set('system:time_start', t.millis()).rename(bn)
         iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t.millis()).rename(bn)
         return iqr
     
     if agg_fx == 'sum':
-        yr_agg = dates.map(reduceSum)
+        yr_agg = mc_filt.map(reduceSum)
     elif agg_fx == 'mean':
-        yr_agg = dates.map(reduceMean)
+        yr_agg = mc_filt.map(reduceMean)
     elif agg_fx == 'iqr':
-        yr_agg = dates.map(reduceIQR)
+        yr_agg = mc_filt.map(reduceIQR)
     elif agg_fx == '9010':
-        yr_agg = dates.map(reduce9010)
+        yr_agg = mc_filt.map(reduce9010)
         
     #Convert back into an image collection
     yearly = ee.ImageCollection.fromImages(yr_agg)
@@ -433,31 +451,43 @@ def aggregate_to_monthly(collection, ds, de, agg_fx='sum'):
     #Get band name
     bn = collection.first().bandNames().getInfo()[0]
     
-    def reduceSum(t):
+    def create_sub_collections(t):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(1, 'month'))
+        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
+    
+    mc = dates.map(create_sub_collections)
+    mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
+    
+    def reduceSum(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
         daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
         return daysum
     
-    def reduceMean(t):
-        t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(1, 'month'))
+    def reduceMean(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
         daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
         return daymn
+
+    def reduceMedian(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        daymn = filt_coll.reduce(ee.Reducer.median()).set('system:time_start', t.millis()).rename(bn)
+        return daymn
     
-    def reduceSTD(t):
-        t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(1, 'month'))
+    def reduceSTD(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
         daymn = filt_coll.reduce(ee.Reducer.stdDev()).set('system:time_start', t.millis()).rename(bn)
         return daymn
     
     #Map over the list of months, return either a mean or a sum of those values
     if agg_fx == 'sum':
-        mo_agg = dates.map(reduceSum)
+        mo_agg = mc_filt.map(reduceSum)
     elif agg_fx == 'mean':
-        mo_agg = dates.map(reduceMean)
+        mo_agg = mc_filt.map(reduceMean)
+    elif agg_fx == 'median':
+        mo_agg = mc_filt.map(reduceMedian)
     elif agg_fx == 'std':
-        mo_agg = dates.map(reduceSTD)
+        mo_agg = mc_filt.map(reduceSTD)
         
     #Convert back into an image collection
     monthly = ee.ImageCollection.fromImages(mo_agg)
@@ -483,27 +513,119 @@ def aggregate_to_daily(collection, ds, de, dayskip=1, agg_fx='sum'):
     #Get Band Name
     bn = collection.first().bandNames().getInfo()[0]
     
-    def reduceSum(t):
+    def create_sub_collections(t):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(dayskip, 'day'))
+        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
+    
+    mc = dates.map(create_sub_collections)
+    mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
+    
+    def reduceSum(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
         daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
         return daysum
     
-    def reduceMean(t):
-        t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(dayskip, 'day'))
+    def reduceMean(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
         daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
         return daymn
     
     if agg_fx == 'sum':
-        daily_agg = dates.map(reduceSum)
+        daily_agg = mc_filt.map(reduceSum)
     elif agg_fx == 'mean':
-        daily_agg = dates.map(reduceMean)
+        daily_agg = mc_filt.map(reduceMean)
         
     #Convert back to Image Collection
     daily = ee.ImageCollection.fromImages(daily_agg)
     
     return daily
+
+def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
+    '''
+    Centered window aggregation (pm window size)
+    '''
+    start, end = ee.Date(ds), ee.Date(de)
+    difdate = end.difference(start, 'month')
+    length = ee.List.sequence(0, difdate.subtract(1))
+    
+    def gen_datelist(mo):
+        return start.advance(mo, 'month')
+    
+    dates = length.map(gen_datelist)
+
+    bn = collection.first().bandNames().getInfo()[0]
+    
+    def create_sub_collections(t):
+        t = ee.Date(t)
+        filt_coll = collection.filterDate(t.advance(-1*window, 'month'), t.advance(window, 'month'))
+        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
+    
+    mc = dates.map(create_sub_collections)
+    mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
+    
+    def reduceFit(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        def createTimeBand(image):
+            date = ee.Date(image.get('system:time_start'))
+            years = date.difference(ee.Date('1970-01-01'), 'month')
+            return image.addBands(ee.Image(years).rename('t')).float().addBands(ee.Image.constant(1))
+        
+        c = filt_coll.map(createTimeBand)
+        fit = c.select(['t',bn]).reduce(ee.Reducer.linearFit()).select('scale')
+        return fit
+    
+    def reduceSum(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
+        return daysum
+    
+    def reduceMean(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
+        return daymn
+
+    def reduceMedian(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        daymn = filt_coll.reduce(ee.Reducer.median()).set('system:time_start', t.millis()).rename(bn)
+        return daymn
+    
+    def reduceSTD(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        daymn = filt_coll.reduce(ee.Reducer.stdDev()).set('system:time_start', t.millis()).rename(bn)
+        return daymn
+        
+    def reduceIQR(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
+        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        return iqr
+    
+    def reduce9010(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
+        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        return iqr
+        
+    #Map over the list of months, return either a mean or a sum of those values
+    if agg_fx == 'sum':
+        mo_agg = mc_filt.map(reduceSum)
+    elif agg_fx == 'mean':
+        mo_agg = mc_filt.map(reduceMean)
+    elif agg_fx == 'median':
+        mo_agg = mc_filt.map(reduceMedian)
+    elif agg_fx == 'std':
+        mo_agg = mc_filt.map(reduceSTD)
+    elif agg_fx == 'fit':
+        mo_agg = mc_filt.map(reduceFit)
+    elif agg_fx == 'iqr':
+        mo_agg = mc_filt.map(reduceIQR)
+    elif agg_fx == '9010':
+        mo_agg = mc_filt.map(reduce9010)
+        
+    monthly = ee.ImageCollection.fromImages(mo_agg)
+    
+    return monthly
 
 def monthly_averages(collection, agg_fx='mean', years=None):
     '''
@@ -568,7 +690,7 @@ def seasonal_composite(monthly, season):
     if season == 'SON':
         for m in [9, 10, 11]:
             allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
-        filt = ee.Filter.Or(allfilts)
+        filt = ee.Filter.Or(allfilts)    
     return monthly.filter(filt)
 
 #%% Join Collections
