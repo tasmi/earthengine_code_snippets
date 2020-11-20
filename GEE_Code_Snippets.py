@@ -9,11 +9,11 @@ import ee
 ee.Initialize()
 
 #%% General Helper Functions
-def run_export(image, crs, filename, scale, region, maxPixels=1e12):
+def run_export(image, crs, filename, scale, region, maxPixels=1e12, cloud_optimized=True):
     '''
     Runs an export function on GEE servers
     '''
-    task_config = {'fileNamePrefix': filename,'crs': crs,'scale': scale,'maxPixels': maxPixels,'fileFormat': 'GeoTIFF','region': region,}
+    task_config = {'fileNamePrefix': filename,'crs': crs,'scale': scale,'maxPixels': maxPixels, 'fileFormat': 'GeoTIFF', 'formatOptions': {'cloudOptimized': cloud_optimized}, 'region': region,}
     task = ee.batch.Export.image.toDrive(image, filename, **task_config)
     task.start()
 
@@ -57,6 +57,27 @@ def mask_invalid(collection, minval, maxval, band=None):
         return image.updateMask(mask1).updateMask(mask2)
     return collection.map(apply_mask)
 
+def apply_mask(collection, mask):
+    '''
+    Simple function to apply a static mask to all images in a collection
+    '''
+    
+    def apply_fx(image):
+        return image.updateMask(mask)
+    return collection.map(apply_fx)
+
+def add_doy(image):
+    ''' Add a day of year as an image band '''
+    ts = image.get('system:time_start')
+    #return image.addBands(ee.Image.constant(ee.Number.parse(image.date().millis())).rename('day').float())
+    #return image.addBands(ee.Image.constant(ee.Number.parse(image.date().format("YYYYMMdd"))).rename('day').float())
+    doy = ee.Image.constant(ee.Number.parse(image.date().format("D"))).rename('day')#.float().set('system:time_start', ts)
+    return image.addBands(doy)
+
+def invert(image):
+    ''' Invert an Image '''
+    return image.multiply(-1)
+
 #%% Time Series Functions
 def prevdif(collection):
     ''' 
@@ -66,8 +87,13 @@ def prevdif(collection):
     def dif(f):
         #sdate = ee.Date(ee.Image(ee.List(f).get(0)).get('system:time_start'))
         f = ee.Number(f)
-        edate = ee.Date(ee.Image(ic_list.get(f)).get('system:time_start'))
-        return ee.Image(ic_list.get(f.add(1))).subtract(ee.Image(ic_list.get(f))).set('system:time_start', edate)
+        simage = ee.Image(ic_list.get(f))
+        snext = ee.Image(ic_list.get(f.add(1)))
+        sdate = simage.get('system:time_start')
+        
+        d = snext.subtract(simage).set('system:time_start', sdate)
+        
+        return d
     
     ic_list = collection.sort('system:time_start').toList(collection.size())
     seq = ee.List.sequence(0, collection.size().subtract(2)) #Drop the final image since we don't have the next to subtract
@@ -75,6 +101,34 @@ def prevdif(collection):
     
     return ee.ImageCollection.fromImages(ic_diff)
 
+def windowed_difference(collection, window):
+    ''' 
+    Get a windowed difference between sequential images in an image collection.
+    NOTE: It is important to do a tight spatial filtering first!
+    '''
+    
+    half_window = int(window / 2)
+    
+    def windif_fx(f):
+        f = ee.Number(f)
+        edate = ee.Image(image_list.get(f)).get('system:time_start')
+        
+        forward_slice = image_list.slice(f, f.add(half_window))
+        backward_slice = image_list.slice(f.subtract(half_window), f)
+        
+        forward_mean = ee.ImageCollection.fromImages(forward_slice).reduce(ee.Reducer.mean())
+        backward_mean = ee.ImageCollection.fromImages(backward_slice).reduce(ee.Reducer.mean())
+        
+        return ee.Image(forward_mean.subtract(backward_mean)).set('system:time_start', edate)
+            
+    ln = ee.Number(collection.size()) #Length of time series
+    image_list = collection.sort('system:time_start').toList(ln)
+    
+    seq = ee.List.sequence(half_window, ln.subtract(half_window)) #Drop the final image since we don't have the next to subtract
+    windif = seq.map(windif_fx)
+    
+    return ee.ImageCollection.fromImages(windif)
+    
 def detrend(collection, return_detrend=False):
     """ 
     Simple linear detrender to center a dataset around mean zero with no linear trend.
@@ -371,17 +425,28 @@ def fit_multi_harmonic(collection, harmonics=3):
     return [fittedHarmonic.select('fitted'), multiphase, multiamp, rsq]
 
 #%% Data Aggregation Functions
-def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
+def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', agg_var=None):
     '''
-    Take an ImageCollection and convert it into a yearly value
+    Take an ImageCollection and convert it into an aggregated value based on an arbitrary function.
+    Several useful functions are included with keywords (mean, sum, etc), but an arbitrary reducer can be supplied
+    
+    day, month, year are the typical arguments
+    
+    skip will allow you to make larger windows (e.g., 5 days)
+    
     '''
     start, end = ee.Date(ds), ee.Date(de)
-    #Generate list of years
-    difdate = end.difference(start, 'year')
+    #Generate length of months to look through
+    difdate = end.difference(start, timeframe)
     length = ee.List.sequence(0, difdate.subtract(1))
     
-    def gen_datelist(yr):
-        return start.advance(yr, 'year')
+    if not skip == 1:
+        length_py = length.getInfo()
+        length_skip = length_py[::skip]
+        length = ee.List(length_skip)
+    
+    def gen_datelist(t):
+        return start.advance(t, timeframe)
     
     dates = length.map(gen_datelist)
 
@@ -390,94 +455,74 @@ def aggregate_to_yearly(collection, ds, de, agg_fx='sum'):
     
     def create_sub_collections(t):
         t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(1, 'year'))
+        filt_coll = collection.filterDate(t, t.advance(skip, timeframe)) #Move forward the 'skip' amount of time units
         return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
     
     mc = dates.map(create_sub_collections)
     mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
-    
+
     def reduceSum(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
+        daysum = filt_coll.reduce(ee.Reducer.sum())#.set('system:time_start', t.millis()).rename(bn)
         return daysum
     
     def reduceMean(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
+        daymn = filt_coll.reduce(ee.Reducer.mean())#.set('system:time_start', t.millis()).rename(bn)
+        return daymn
+
+    def reduceMedian(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        daymn = filt_coll.reduce(ee.Reducer.median())#.set('system:time_start', t.millis()).rename(bn)
+        return daymn
+    
+    def reduceSTD(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        daymn = filt_coll.reduce(ee.Reducer.stdDev())#.set('system:time_start', t.millis()).rename(bn)
         return daymn
     
     def reduceIQR(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
         pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
-        #iqr = pcts.select(bn.cat('_p75')).subtract(pcts.select(bn.cat('_p25'))).toFloat().set('system:time_start', t.millis()).rename(bn)
-        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
         return iqr
     
     def reduce9010(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)  
         pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
-        #iqr = pcts.select(bn.cat('_p90')).subtract(pcts.select(bn.cat('_p10'))).toFloat().set('system:time_start', t.millis()).rename(bn)
-        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
         return iqr
     
-    if agg_fx == 'sum':
-        yr_agg = mc_filt.map(reduceSum)
-    elif agg_fx == 'mean':
-        yr_agg = mc_filt.map(reduceMean)
-    elif agg_fx == 'iqr':
-        yr_agg = mc_filt.map(reduceIQR)
-    elif agg_fx == '9010':
-        yr_agg = mc_filt.map(reduce9010)
-        
-    #Convert back into an image collection
-    yearly = ee.ImageCollection.fromImages(yr_agg)
+    def reduce955(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)  
+        pcts = filt_coll.reduce(ee.Reducer.percentile([5,95]))
+        iqr = pcts.select(bn + '_p95').subtract(pcts.select(bn + '_p5')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
+        return iqr
     
-    return yearly
+    def binary_mask(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        if agg_var == 'NDVI':
+            #Map all positive values to zero, all negative values to 1
+            def reclass(image):
+                remapped = customRemap(image, 0, 1, 0)
+                remapped2 = customRemap(remapped, -1, -0.00001, 1)
+                return remapped2
+        if agg_var == 'NDWI':
+            #Map all positive values to zero, all negative values to 1
+            def reclass(image):
+                remapped = customRemap(image, -1, 0.45, 0)
+                remapped2 = customRemap(remapped, 0.45, 1, 1)
+                return remapped2
+        if agg_var == 'MNDWI':
+            #Map all positive values to zero, all negative values to 1
+            def reclass(image):
+                remapped = customRemap(image, -1, 0.5, 0)
+                remapped2 = customRemap(remapped, 0.5, 1, 1)
+                return remapped2
 
-def aggregate_to_monthly(collection, ds, de, agg_fx='sum'):
-    '''
-    Take an ImageCollection and convert it into a monthly value
-    '''
-    start, end = ee.Date(ds), ee.Date(de)
-    #Generate length of months to look through
-    difdate = end.difference(start, 'month')
-    length = ee.List.sequence(0, difdate.subtract(1))
-    
-    def gen_datelist(mo):
-        return start.advance(mo, 'month')
-    
-    dates = length.map(gen_datelist)
-
-    #Get band name
-    bn = collection.first().bandNames().getInfo()[0]
-    
-    def create_sub_collections(t):
-        t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(1, 'month'))
-        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
-    
-    mc = dates.map(create_sub_collections)
-    mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
-    
-    def reduceSum(filt_coll):
-        filt_coll = ee.ImageCollection(filt_coll)
-        daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
-        return daysum
-    
-    def reduceMean(filt_coll):
-        filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
-        return daymn
-
-    def reduceMedian(filt_coll):
-        filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.median()).set('system:time_start', t.millis()).rename(bn)
-        return daymn
-    
-    def reduceSTD(filt_coll):
-        filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.stdDev()).set('system:time_start', t.millis()).rename(bn)
-        return daymn
+        rm = filt_coll.map(reclass)
+        occur = rm.reduce(ee.Reducer.sum()).toUint8()
+        return occur
     
     #Map over the list of months, return either a mean or a sum of those values
     if agg_fx == 'sum':
@@ -488,58 +533,63 @@ def aggregate_to_monthly(collection, ds, de, agg_fx='sum'):
         mo_agg = mc_filt.map(reduceMedian)
     elif agg_fx == 'std':
         mo_agg = mc_filt.map(reduceSTD)
+    elif agg_fx == 'binary_mask':
+        mo_agg = mc_filt.map(binary_mask)
+    elif agg_fx == 'iqr':
+        mo_agg = mc_filt.map(reduceIQR)
+    elif agg_fx == '9010':
+        mo_agg = mc_filt.map(reduce9010)
+    else:
+        mo_agg = mc_filt.map(agg_fx)
         
     #Convert back into an image collection
-    monthly = ee.ImageCollection.fromImages(mo_agg)
+    agged = ee.ImageCollection.fromImages(mo_agg)
     
-    return monthly
+    return agged
 
-def aggregate_to_daily(collection, ds, de, dayskip=1, agg_fx='sum'):
+def windowed_difference_date(collection, ds, de, window_size, window_unit):
+    ''' 
+    Get a windowed difference between sequential images in an image collection.
+    NOTE: It is important to do a tight spatial filtering first!
+    '''
+    
     start, end = ee.Date(ds), ee.Date(de)
-    #Generate days
-    difdate = end.difference(start, 'day')
-    length = ee.List.sequence(0, difdate.subtract(1))
+    difdate = end.difference(start, window_unit)
+    ln = ee.List.sequence(0, difdate.subtract(1))
     
-    if not dayskip == 1:
-        length_py = length.getInfo()
-        length_skip = length_py[::dayskip]
-        length = ee.List(length_skip)
+    half_window = int(window_size / 2)
+        
+    def gen_datelist(t):
+        return start.advance(t, window_unit)
     
-    def gen_datelist(day):
-        return start.advance(day, 'day')
-    
-    dates = length.map(gen_datelist)
-
-    #Get Band Name
-    bn = collection.first().bandNames().getInfo()[0]
+    dates = ln.map(gen_datelist)
     
     def create_sub_collections(t):
         t = ee.Date(t)
-        filt_coll = collection.filterDate(t, t.advance(dayskip, 'day'))
-        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
+        filt_coll = collection.filterDate(t.advance(-1*half_window, window_unit), t.advance(half_window, window_unit))
+        return filt_coll.set('bandcount', ee.Number(filt_coll.size())).set('date', t)
     
     mc = dates.map(create_sub_collections)
     mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
     
-    def reduceSum(filt_coll):
+    def windif_fx(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
-        return daysum
-    
-    def reduceMean(filt_coll):
-        filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
-        return daymn
-    
-    if agg_fx == 'sum':
-        daily_agg = mc_filt.map(reduceSum)
-    elif agg_fx == 'mean':
-        daily_agg = mc_filt.map(reduceMean)
+        edate = ee.Date(filt_coll.get('date'))
         
-    #Convert back to Image Collection
-    daily = ee.ImageCollection.fromImages(daily_agg)
+        forward_slice = filt_coll.filterDate(edate.advance(-1*half_window, window_unit), edate)
+        backward_slice = filt_coll.filterDate(edate, edate.advance(half_window, window_unit))
+        
+        #forward_slice = image_list.slice(f, f.add(half_window))
+        #backward_slice = image_list.slice(f.subtract(half_window), f)
+        
+        forward_mean = forward_slice.reduce(ee.Reducer.mean())
+        backward_mean = backward_slice.reduce(ee.Reducer.mean())
+        
+        return ee.Image(forward_mean.subtract(backward_mean)).set('system:time_start', edate)
+            
+    windif = mc_filt.map(windif_fx)
     
-    return daily
+    return ee.ImageCollection(windif)
 
 def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
     '''
@@ -577,34 +627,34 @@ def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
     
     def reduceSum(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t.millis()).rename(bn)
+        daysum = filt_coll.reduce(ee.Reducer.sum())#.set('system:time_start', t.millis()).rename(bn)
         return daysum
     
     def reduceMean(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t.millis()).rename(bn)
+        daymn = filt_coll.reduce(ee.Reducer.mean())#.set('system:time_start', t.millis()).rename(bn)
         return daymn
 
     def reduceMedian(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.median()).set('system:time_start', t.millis()).rename(bn)
+        daymn = filt_coll.reduce(ee.Reducer.median())#.set('system:time_start', t.millis()).rename(bn)
         return daymn
     
     def reduceSTD(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.stdDev()).set('system:time_start', t.millis()).rename(bn)
+        daymn = filt_coll.reduce(ee.Reducer.stdDev())#.set('system:time_start', t.millis()).rename(bn)
         return daymn
         
     def reduceIQR(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
         pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
-        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
         return iqr
     
     def reduce9010(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
         pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
-        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
         return iqr
         
     #Map over the list of months, return either a mean or a sum of those values
@@ -693,6 +743,20 @@ def seasonal_composite(monthly, season):
         filt = ee.Filter.Or(allfilts)    
     return monthly.filter(filt)
 
+def to_percent(collection, threshold_min, threshold_max):
+    '''
+    Finds the amount of time (percentage) a collection is within a given threshold.
+    '''
+    def newbounds(image):
+        #remap here to max of one
+        rc = ee.Image(0).where(image.gt(threshold_min).And(image.lte(threshold_max)), 1)
+        return rc
+    flt = collection.map(newbounds)
+    su = flt.reduce(ee.Reducer.sum()).toFloat()
+    ct = flt.reduce(ee.Reducer.count()).toFloat()
+    pct = su.divide(ct).multiply(100).rename('PCT')
+    return pct
+
 #%% Join Collections
 def join_timeagg_collections(c1, c2):
     filt = ee.Filter.equals(leftField='system:time_start', rightField='system:time_start') 
@@ -741,7 +805,10 @@ def two_band_reg(c1, c2, crs, name, polygon, scale=30):
     lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']]).select('trend')
     run_export(lrImage, crs, name + '_RobustLinReg', scale, polygon)
 
-def same_inst_twoband_reg(collection, crs, name, polygon, scale=30):
+def same_inst_twoband_reg(collection, crs, name, polygon, scale=30, export='Slope'):
+    '''
+    Export can be 'Slope', 'Intercept', or 'Both'
+    '''
     bn = collection.first().bandNames()
     
     def createConstantBand(image):
@@ -753,8 +820,10 @@ def same_inst_twoband_reg(collection, crs, name, polygon, scale=30):
     
     fit = prepped.select(var).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
     lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']])
-    run_export(lrImage.select('trend'), crs, name + '_RobustLinReg_slope', scale, polygon)
-    run_export(lrImage.select('constant'), crs, name + '_RobustLinReg_intercept', scale, polygon)
+    if export in ['Slope', 'Both']:
+        run_export(lrImage.select('trend'), crs, name + '_RobustLinReg_slope', scale, polygon)
+    if export in ['Intercept', 'Both']:
+        run_export(lrImage.select('constant'), crs, name + '_RobustLinReg_intercept', scale, polygon)
 
 #%% Data Import and Cleaning Functions
 ### GPM
@@ -778,6 +847,14 @@ def NDWI_L8(image):
 
 def NDWI_L7(image):
     ndwi = image.normalizedDifference(['B4', 'B5']).rename('NDWI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(ndwi)
+
+def MNDWI_L8(image):
+    ndwi = image.normalizedDifference(['B3', 'B6']).rename('MNDWI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(ndwi)
+
+def MNDWI_L7(image):
+    ndwi = image.normalizedDifference(['B2', 'B5']).rename('MNDWI').set('system:time_start', image.get('system:time_start'))
     return image.addBands(ndwi)
 
 def maskL8sr(image):
@@ -806,6 +883,10 @@ def NDVI_S2(image):
 
 def NDWI_S2(image):
     ndwi = image.normalizedDifference(['B8', 'B11']).rename('NDWI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(ndwi)
+
+def MNDWI_S2(image):
+    ndwi = image.normalizedDifference(['B3', 'B11']).rename('MNDWI').set('system:time_start', image.get('system:time_start'))
     return image.addBands(ndwi)
 
 def maskS2clouds(image):
@@ -843,19 +924,28 @@ def L8_Temp(image):
                               'Ep': EM.select('EMM')}).rename('LST')
     return LST.select('LST').set('system:time_start', image.get('system:time_start'))
 
-def focal_med_filt(collection, band, radius=100):
+def focal_med_filt(collection, radius=100):
     ''' 
     Apply a focal median filter to a selected band, with flexible radius
     '''
-    def apply(img):
-        sel = img.select(band)
-        smoothed = sel.focal_median(radius, 'circle', 'meters').rename(band)
-        return smoothed
-    return collection.map(apply)
+    bn = collection.first().bandNames().getInfo()
+    
+    def applyfx(image):
+        for b in bn:
+            sel = image.select(b)
+            smoothed = sel.focal_median(radius, 'circle', 'meters')
+            image = image.addBands(smoothed.rename(b + '_filt'))
+        return image
+    return collection.map(applyfx)
 
 #%% Sentinel 1 Specific Functions
 
-#Can try edge masking with high/low angle
+#Translate to Gamma0
+def make_gamma0(image):
+  angle = image.select('angle').resample('bicubic')
+  return image.select('..').divide(angle.multiply(np.pi/180.0).cos()).copyProperties(image, ['system:time_start'])
+
+#Edge masking with high/low angle
 def maskAngGT30(image):
     ang = image.select(['angle'])
     return image.updateMask(ang.gt(30.63993))
@@ -931,7 +1021,7 @@ def RefinedLee(img):
     sample_stats = sample_var.divide(sample_mean.multiply(sample_mean))
 
     #Calculate localNoiseVariance
-    sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0])
+    sigmaV = ee.Image(sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]))
 
     #Set up the 7*7 kernels for directional statistics
     rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4))
@@ -957,23 +1047,25 @@ def RefinedLee(img):
         dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)))
 
     #"collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
-    dir_mean = dir_mean.reduce(ee.Reducer.sum());
-    dir_var = dir_var.reduce(ee.Reducer.sum());
+    dir_mean = dir_mean.reduce(ee.Reducer.sum())
+    dir_var = dir_var.reduce(ee.Reducer.sum())
 
     #And finally generate the filtered value
     varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0))
     b = varX.divide(dir_var)
 
-    result = dir_mean.add(b.multiply(img.subtract(dir_mean)))
+    result = ee.Image(dir_mean.add(b.multiply(img.subtract(dir_mean))))
     return result
 
 def apply_speckle_filt(collection):
     bn = collection.first().bandNames().getInfo()
     def applyfx(image):
         for b in bn:
-            updated = toDB(RefinedLee(toNatural(image.select(b))))
+            nat = toNatural(image.select(b)) #Convert to log scale
+            filt = RefinedLee(nat) #Speckle Filter
+            updated = toDB(filt) #Convert back to decibels
             image = image.addBands(updated.rename(b + '_filt'))
-        return image
+        return ee.Image(image)
     return collection.map(applyfx)
 
 def terrainCorrection(image):
@@ -1045,6 +1137,31 @@ def terrainCorrection(image):
 
     return image.addBands(output.select(['VV', 'VH', 'slope_1', 'slope_2'], ['VV', 'VH', 'layover', 'shadow']),None, True)
 
+def NBMI(collection):
+    ''' 
+    Calculate the NBMI based on Shoshaney et al. 2000 Int. J. Remote Sensing
+    NBMI = A + B / A - B, where A and B are backscatter at two dates. 
+    
+    NOTE: It is important to do a tight spatial filtering first!
+    '''
+    def dif(f):
+        #sdate = ee.Date(ee.Image(ee.List(f).get(0)).get('system:time_start'))
+        f = ee.Number(f)
+        simage = ee.Image(ic_list.get(f))
+        snext = ee.Image(ic_list.get(f.add(1)))
+        sdate = simage.get('system:time_start')
+        
+        su = simage.add(snext)
+        dif = simage.subtract(snext)
+        ret = su.divide(dif).set('system:time_start', sdate)
+        
+        return ret
+    
+    ic_list = collection.sort('system:time_start').toList(collection.size())
+    seq = ee.List.sequence(0, collection.size().subtract(2)) #Drop the final image since we don't have the next to subtract
+    ic_diff = seq.map(dif)
+    
+    return ee.ImageCollection.fromImages(ic_diff)
 
 #%% Online Filtering
 def apply_SG(collect, geom, window_size=7, imageAxis=0, bandAxis=1, order=3):
