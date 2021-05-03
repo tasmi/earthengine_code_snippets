@@ -7,6 +7,7 @@ Created on Tue Jul 14 11:16:43 2020
 
 import ee
 ee.Initialize()
+import numpy as np
 
 #%% General Helper Functions
 def run_export(image, crs, filename, scale, region, maxPixels=1e12, cloud_optimized=True):
@@ -27,9 +28,11 @@ def gee_geometry_from_shapely(geom, crs='epsg:4326'):
     if ty == 'Polygon':
         return ee.Geometry.Polygon(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)
     elif ty == 'Point':
-        return ee.Geometry.Point(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)    
+        return ee.Geometry.Point(ee.List(mapping(geom)['coordinates']), proj=crs)    
     elif ty == 'MultiPolygon':
         return ee.Geometry.MultiPolygon(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)
+    elif ty == 'MultiPoint':
+        return ee.Geometry.MultiPoint(ee.List(mapping(geom)['coordinates']), proj=crs)
     
 def customRemap(image, lowerLimit, upperLimit, newValue):
     mask = image.gt(lowerLimit).And(image.lte(upperLimit))
@@ -68,11 +71,16 @@ def apply_mask(collection, mask):
 
 def add_doy(image):
     ''' Add a day of year as an image band '''
-    ts = image.get('system:time_start')
+    #ts = image.get('system:time_start')
     #return image.addBands(ee.Image.constant(ee.Number.parse(image.date().millis())).rename('day').float())
     #return image.addBands(ee.Image.constant(ee.Number.parse(image.date().format("YYYYMMdd"))).rename('day').float())
-    doy = ee.Image.constant(ee.Number.parse(image.date().format("D"))).rename('day')#.float().set('system:time_start', ts)
+    doy = ee.Image.constant(ee.Number.parse(image.date().format("D"))).rename('day').toUint32()#.float().set('system:time_start', ts)
     return image.addBands(doy)
+
+def add_date(image):
+    ''' Add a date as an image band '''
+    date = ee.Image.constant(ee.Number.parse(image.date().format('YYYYMMdd'))).rename('date').toUint32()
+    return image.addBands(date)
 
 def invert(image):
     ''' Invert an Image '''
@@ -144,7 +152,7 @@ def detrend(collection, return_detrend=False):
     
     def addVariables(image):
         date = ee.Date(image.get('system:time_start'))
-        years = date.difference(ee.Date('1970-01-01'), 'year');
+        years = date.difference(ee.Date('1970-01-01'), 'year')
         return image.addBands(ee.Image(years).rename('t')).float().addBands(ee.Image.constant(1))
 
     independents = ee.List(['constant', 't'])
@@ -425,6 +433,39 @@ def fit_multi_harmonic(collection, harmonics=3):
     return [fittedHarmonic.select('fitted'), multiphase, multiamp, rsq]
 
 #%% Data Aggregation Functions
+def match_time_sampling(collection1, collection2, ds, de, reducer):
+    ''' 
+    Take an IC and aggregate to the time sampling of another IC. 
+    Referenced to the first collection.
+    ds, de = start and end date
+    '''
+    
+    def make_filter(item):
+        image = ee.Image(item)
+        sd = image.get('system:time_start')
+        ed = image.get('system:time_end')
+        filt = ee.Filter.date(sd, ed)
+        return filt
+    
+    c1 = collection1.toList(collection1.size())
+    filts = c1.map(make_filter)
+    
+    def create_sub_collections(filt):
+        filt_coll = collection2.filter(filt)
+        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
+    
+    mc = filts.map(create_sub_collections)
+    mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
+    
+    def map_red(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        filt_date = filt_coll.first().get('system:time_start')
+        return filt_coll.reduce(reducer).set('system:time_start', filt_date)
+    
+    agged = mc_filt.map(map_red)
+    
+    return ee.ImageCollection(agged)  
+
 def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', agg_var=None):
     '''
     Take an ImageCollection and convert it into an aggregated value based on an arbitrary function.
@@ -456,56 +497,82 @@ def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', ag
     def create_sub_collections(t):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t, t.advance(skip, timeframe)) #Move forward the 'skip' amount of time units
-        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
+        return filt_coll.set('bandcount', ee.Number(filt_coll.size())).set('system:time_start', t.millis())
     
     mc = dates.map(create_sub_collections)
     mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
 
     def reduceSum(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daysum = filt_coll.reduce(ee.Reducer.sum())#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t).rename(bn)
         return daysum
     
     def reduceMean(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.mean())#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t).rename(bn)
+        return daymn
+    
+    def reduceMin(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        t = filt_coll.get('system:time_start')
+        daymn = filt_coll.reduce(ee.Reducer.min()).set('system:time_start', t).rename(bn)
+        return daymn
+    
+    def reduceMax(filt_coll):
+        filt_coll = ee.ImageCollection(filt_coll)
+        t = filt_coll.get('system:time_start')
+        daymn = filt_coll.reduce(ee.Reducer.max()).set('system:time_start', t).rename(bn)
         return daymn
 
     def reduceMedian(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.median())#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        daymn = filt_coll.reduce(ee.Reducer.median()).set('system:time_start', t).rename(bn)
         return daymn
     
     def reduceSTD(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.stdDev())#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        daymn = filt_coll.reduce(ee.Reducer.stdDev()).set('system:time_start', t).rename(bn)
         return daymn
     
     def reduceIQR(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
+        t = filt_coll.get('system:time_start')
         pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
-        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t).rename(bn)
         return iqr
     
     def reduce9010(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)  
+        t = filt_coll.get('system:time_start')
         pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
-        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t).rename(bn)
         return iqr
     
     def reduce955(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)  
         pcts = filt_coll.reduce(ee.Reducer.percentile([5,95]))
-        iqr = pcts.select(bn + '_p95').subtract(pcts.select(bn + '_p5')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        iqr = pcts.select(bn + '_p95').subtract(pcts.select(bn + '_p5')).toFloat().set('system:time_start', t).rename(bn)
         return iqr
     
     def binary_mask(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
+        t = filt_coll.get('system:time_start')
         if agg_var == 'NDVI':
-            #Map all positive values to zero, all negative values to 1
             def reclass(image):
-                remapped = customRemap(image, 0, 1, 0)
-                remapped2 = customRemap(remapped, -1, -0.00001, 1)
+                #No veg == 0, veg == 1
+                remapped = customRemap(image, -1, 0.4, 0)
+                remapped2 = customRemap(remapped, 0.4, 1, 1)
+                return remapped2
+        if agg_var == 'NDVI2':
+            def reclass(image):
+                #No veg == 0, veg == 1
+                remapped = customRemap(image, -1, 0.5, 0)
+                remapped2 = customRemap(remapped, 0.5, 1, 1)
                 return remapped2
         if agg_var == 'NDWI':
             #Map all positive values to zero, all negative values to 1
@@ -519,14 +586,23 @@ def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', ag
                 remapped = customRemap(image, -1, 0.5, 0)
                 remapped2 = customRemap(remapped, 0.5, 1, 1)
                 return remapped2
+        if agg_var == 'S1':
+            def reclass(image):
+                remapped = customRemap(image, -25, 0, 0)
+                remapped2 = customRemap(remapped, -60, -25, 1)
+                return remapped2
 
         rm = filt_coll.map(reclass)
-        occur = rm.reduce(ee.Reducer.sum()).toUint8()
+        occur = rm.reduce(ee.Reducer.sum()).toUint8().set('system:time_start', t).rename(bn)
         return occur
     
     #Map over the list of months, return either a mean or a sum of those values
     if agg_fx == 'sum':
         mo_agg = mc_filt.map(reduceSum)
+    elif agg_fx == 'min':
+        mo_agg = mc_filt.map(reduceMin)
+    elif agg_fx == 'max':
+        mo_agg = mc_filt.map(reduceMax)
     elif agg_fx == 'mean':
         mo_agg = mc_filt.map(reduceMean)
     elif agg_fx == 'median':
@@ -544,6 +620,7 @@ def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', ag
         
     #Convert back into an image collection
     agged = ee.ImageCollection.fromImages(mo_agg)
+    agged = agged.filter(ee.Filter.listContains('system:band_names', bn))
     
     return agged
 
@@ -591,6 +668,18 @@ def windowed_difference_date(collection, ds, de, window_size, window_unit):
     
     return ee.ImageCollection(windif)
 
+def reduceFit(collection):
+    t = collection.get('system:time_start')
+    bn = collection.first().bandNames().getInfo()[0]
+    def createTimeBand(image):
+        date = ee.Date(image.get('system:time_start'))
+        years = date.difference(ee.Date('1970-01-01'), 'month')
+        return image.addBands(ee.Image(years).rename('t')).float().addBands(ee.Image.constant(1))
+    
+    c = collection.map(createTimeBand)
+    fit = c.select(['t',bn]).reduce(ee.Reducer.linearFit()).select('scale')
+    return fit.set('system:time_start', t)
+
 def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
     '''
     Centered window aggregation (pm window size)
@@ -609,13 +698,14 @@ def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
     def create_sub_collections(t):
         t = ee.Date(t)
         filt_coll = collection.filterDate(t.advance(-1*window, 'month'), t.advance(window, 'month'))
-        return filt_coll.set('bandcount', ee.Number(filt_coll.size()))
+        return filt_coll.set('bandcount', ee.Number(filt_coll.size())).set('system:time_start', t.millis())
     
     mc = dates.map(create_sub_collections)
     mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
     
     def reduceFit(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
+        t = filt_coll.get('system:time_start')
         def createTimeBand(image):
             date = ee.Date(image.get('system:time_start'))
             years = date.difference(ee.Date('1970-01-01'), 'month')
@@ -623,38 +713,44 @@ def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
         
         c = filt_coll.map(createTimeBand)
         fit = c.select(['t',bn]).reduce(ee.Reducer.linearFit()).select('scale')
-        return fit
+        return fit.set('system:time_start', t)
     
     def reduceSum(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daysum = filt_coll.reduce(ee.Reducer.sum())#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        daysum = filt_coll.reduce(ee.Reducer.sum()).set('system:time_start', t).rename(bn)
         return daysum
     
     def reduceMean(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.mean())#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        daymn = filt_coll.reduce(ee.Reducer.mean()).set('system:time_start', t).rename(bn)
         return daymn
 
     def reduceMedian(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.median())#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        daymn = filt_coll.reduce(ee.Reducer.median()).set('system:time_start', t).rename(bn)
         return daymn
     
     def reduceSTD(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
-        daymn = filt_coll.reduce(ee.Reducer.stdDev())#.set('system:time_start', t.millis()).rename(bn)
+        t = filt_coll.get('system:time_start')
+        daymn = filt_coll.reduce(ee.Reducer.stdDev()).set('system:time_start', t).rename(bn)
         return daymn
         
     def reduceIQR(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
+        t = filt_coll.get('system:time_start')
         pcts = filt_coll.reduce(ee.Reducer.percentile([25,75]))
-        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p75').subtract(pcts.select(bn + '_p25')).toFloat().set('system:time_start', t).rename(bn)
         return iqr
     
     def reduce9010(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
+        t = filt_coll.get('system:time_start')
         pcts = filt_coll.reduce(ee.Reducer.percentile([10,90]))
-        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat()#.set('system:time_start', t.millis()).rename(bn)
+        iqr = pcts.select(bn + '_p90').subtract(pcts.select(bn + '_p10')).toFloat().set('system:time_start', t).rename(bn)
         return iqr
         
     #Map over the list of months, return either a mean or a sum of those values
@@ -674,6 +770,7 @@ def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
         mo_agg = mc_filt.map(reduce9010)
         
     monthly = ee.ImageCollection.fromImages(mo_agg)
+    #monthly = monthly.filter(ee.Filter.listContains('system:band_names', bn))
     
     return monthly
 
@@ -833,6 +930,14 @@ def mask_GPM(image):
     return precip_filt
 
 ### Landsat
+def NDSI_L7(image):
+    ndvi = image.normalizedDifference(['B2', 'B5']).rename('NDSI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(ndvi)
+
+def NDSI_L8(image):
+    ndvi = image.normalizedDifference(['B3', 'B6']).rename('NDSI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(ndvi)
+
 def NDVI_L7(image):
     ndvi = image.normalizedDifference(['B4', 'B3']).rename('NDVI').set('system:time_start', image.get('system:time_start'))
     return image.addBands(ndvi)
@@ -939,11 +1044,269 @@ def focal_med_filt(collection, radius=100):
     return collection.map(applyfx)
 
 #%% Sentinel 1 Specific Functions
+def slope_correction(collection, model, buffer=0):
+    #Via https://github.com/ESA-PhiLab/radiometric-slope-correction
+    '''This function applies the slope correction on a collection of Sentinel-1 data
+       
+       :param collection: ee.Collection of Sentinel-1
+       :param elevation: ee.Image of DEM
+       :param model: model to be applied (volume/surface)
+       :param buffer: buffer in meters for layover/shadow amsk
+        
+        :returns: ee.Image
+    '''
+    
+    elevation = ee.Image('USGS/SRTMGL1_003')
+    
+    def _volumetric_model_SCF(theta_iRad, alpha_rRad):
+        '''Code for calculation of volumetric model SCF
+        
+        :param theta_iRad: ee.Image of incidence angle in radians
+        :param alpha_rRad: ee.Image of slope steepness in range
+        
+        :returns: ee.Image
+        '''
+        
+        # create a 90 degree image in radians
+        ninetyRad = ee.Image.constant(90).multiply(np.pi/180)
+        
+        # model
+        nominator = (ninetyRad.subtract(theta_iRad).add(alpha_rRad)).tan()
+        denominator = (ninetyRad.subtract(theta_iRad)).tan()
+        return nominator.divide(denominator) 
+    
+    
+    def _surface_model_SCF(theta_iRad, alpha_rRad, alpha_azRad):
+        '''Code for calculation of direct model SCF
+        
+        :param theta_iRad: ee.Image of incidence angle in radians
+        :param alpha_rRad: ee.Image of slope steepness in range
+        :param alpha_azRad: ee.Image of slope steepness in azimuth
+        
+        :returns: ee.Image
+        '''
+        
+        # create a 90 degree image in radians
+        ninetyRad = ee.Image.constant(90).multiply(np.pi/180)
+        
+        # model  
+        nominator = (ninetyRad.subtract(theta_iRad)).cos()
+        denominator = (alpha_azRad.cos()
+          .multiply((ninetyRad.subtract(theta_iRad).add(alpha_rRad)).cos()))
+
+        return nominator.divide(denominator)
+
+
+    def _erode(image, distance):
+      '''Buffer function for raster
+
+      :param image: ee.Image that shoudl be buffered
+      :param distance: distance of buffer in meters
+        
+      :returns: ee.Image
+      '''
+      
+      d = (image.Not().unmask(1)
+          .fastDistanceTransform(30).sqrt()
+          .multiply(ee.Image.pixelArea().sqrt()))
+    
+      return image.updateMask(d.gt(distance))
+    
+    
+    def _masking(alpha_rRad, theta_iRad, buffer):
+        '''Masking of layover and shadow
+        
+        
+        :param alpha_rRad: ee.Image of slope steepness in range
+        :param theta_iRad: ee.Image of incidence angle in radians
+        :param buffer: buffer in meters
+        
+        :returns: ee.Image
+        '''
+        # layover, where slope > radar viewing angle 
+        layover = alpha_rRad.lt(theta_iRad).rename('layover')
+
+        # shadow 
+        ninetyRad = ee.Image.constant(90).multiply(np.pi/180)
+        shadow = alpha_rRad.gt(ee.Image.constant(-1).multiply(ninetyRad.subtract(theta_iRad))).rename('shadow')
+        
+        # add buffer to layover and shadow
+        if buffer > 0:
+            layover = _erode(layover, buffer)   
+            shadow = _erode(shadow, buffer)  
+
+        # combine layover and shadow
+        no_data_mask = layover.And(shadow).rename('no_data_mask')
+        
+        return layover.addBands(shadow).addBands(no_data_mask)
+                        
+        
+    def _correct(image):
+        '''This function applies the slope correction and adds layover and shadow masks
+        
+        '''
+        
+        # get the image geometry and projection
+        geom = image.geometry()
+        proj = image.select(1).projection()
+        
+        # calculate the look direction
+        heading = (ee.Terrain.aspect(image.select('angle'))
+                                     .reduceRegion(ee.Reducer.mean(), geom, 1000)
+                                     .get('aspect'))
+                   
+
+        # Sigma0 to Power of input image
+        sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0))
+
+        # the numbering follows the article chapters
+        # 2.1.1 Radar geometry 
+        theta_iRad = image.select('angle').multiply(np.pi/180)
+        phi_iRad = ee.Image.constant(heading).multiply(np.pi/180)
+        
+        # 2.1.2 Terrain geometry
+        alpha_sRad = ee.Terrain.slope(elevation).select('slope').multiply(np.pi/180).setDefaultProjection(proj).clip(geom)
+        phi_sRad = ee.Terrain.aspect(elevation).select('aspect').multiply(np.pi/180).setDefaultProjection(proj).clip(geom)
+        
+        # we get the height, for export 
+        height = elevation.setDefaultProjection(proj).clip(geom)
+        
+        # 2.1.3 Model geometry
+        #reduce to 3 angle
+        phi_rRad = phi_iRad.subtract(phi_sRad)
+
+        # slope steepness in range (eq. 2)
+        alpha_rRad = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan()
+
+        # slope steepness in azimuth (eq 3)
+        alpha_azRad = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan()
+
+        # local incidence angle (eq. 4)
+        theta_liaRad = (alpha_azRad.cos().multiply((theta_iRad.subtract(alpha_rRad)).cos())).acos()
+        theta_liaDeg = theta_liaRad.multiply(180/np.pi)
+
+        # 2.2 
+        # Gamma_nought
+        gamma0 = sigma0Pow.divide(theta_iRad.cos())
+        gamma0dB = ee.Image.constant(10).multiply(gamma0.log10()).select(['VV', 'VH'], ['VV_gamma0', 'VH_gamma0'])
+        ratio_gamma = (gamma0dB.select('VV_gamma0')
+                        .subtract(gamma0dB.select('VH_gamma0'))
+                        .rename('ratio_gamma0'))
+
+        if model == 'volume':
+            scf = _volumetric_model_SCF(theta_iRad, alpha_rRad)
+
+        if model == 'surface':
+            scf = _surface_model_SCF(theta_iRad, alpha_rRad, alpha_azRad)
+
+        # apply model for Gamm0_f
+        gamma0_flat = gamma0.divide(scf)
+        gamma0_flatDB = (ee.Image.constant(10)
+                         .multiply(gamma0_flat.log10())
+                         .select(['VV', 'VH'],['VV_gamma0flat', 'VH_gamma0flat'])
+                        )
+
+        masks = _masking(alpha_rRad, theta_iRad, buffer)
+
+        # calculate the ratio for RGB vis
+        ratio_flat = (gamma0_flatDB.select('VV_gamma0flat')
+                        .subtract(gamma0_flatDB.select('VH_gamma0flat'))
+                        .rename('ratio_gamma0flat')
+                     )
+
+        return (image.rename(['VV_sigma0', 'VH_sigma0', 'incAngle'])
+                      .addBands(gamma0dB)
+                      .addBands(ratio_gamma)
+                      .addBands(gamma0_flatDB)
+                      .addBands(ratio_flat)
+                      .addBands(alpha_rRad.rename('alpha_rRad'))
+                      .addBands(alpha_azRad.rename('alpha_azRad'))
+                      .addBands(phi_sRad.rename('aspect'))
+                      .addBands(alpha_sRad.rename('slope'))
+                      .addBands(theta_iRad.rename('theta_iRad'))
+                      .addBands(theta_liaRad.rename('theta_liaRad'))
+                      .addBands(masks)
+                      .addBands(height.rename('elevation'))
+                 )    
+    
+    # run and return correction
+    return collection.map(_correct)
+
+def fix_S1(ds, de, polygon, flt=True, orbit=False, gamma=False, direction='Ascending', platform='both'):
+    if flt:
+        #This is not log-scaled (raw power)
+        S1 = ee.ImageCollection('COPERNICUS/S1_GRD_FLOAT')
+    else:
+        #This is log scaled (decibels)
+        S1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    
+    S1 = S1.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))\
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))\
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))\
+    .filterBounds(polygon)\
+    .filterDate(ds, de)
+    
+    if orbit:
+        S1 = S1.filter(ee.Filter.eq('relativeOrbitNumber_start', orbit))
+    
+    if direction == 'Ascending':
+        data = S1.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'))
+    else:
+        data = S1.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+        
+    if not platform == 'both':
+        data = data.filter(ee.Filter.eq('platform_number', platform))
+    
+    #Apply angle masking
+    data = data.map(maskAngGT30)
+    data = data.map(maskAngLT45)
+    
+    #Apply terrain correction
+    if gamma:
+        data = slope_correction(data, 'surface', buffer=0)
+        #Choose the gamma bands and rename
+        def rename(collection, which):
+            def rnfx(image):
+                return image.rename(['VV', 'VH'])
+            return collection.select(which).map(rnfx)            
+                
+        data = rename(data, ['VV_gamma0', 'VH_gamma0'])
+    
+    s1_crs = data.select('VV').first().projection()
+    
+    return data, s1_crs
+
+def filter_s1(Ascending):
+    def make_rat(image):
+        rat = image.select('VV').divide(image.select('VH'))
+        return rat.rename('VVdVH').set('system:time_start', image.get('system:time_start'))
+    
+    def make_rat_filt(image):
+        rat = image.select('VV_filt').divide(image.select('VH_filt'))
+        return rat.rename('VVdVH').set('system:time_start', image.get('system:time_start'))
+    
+    def make_dif(image):
+        rat = image.select('VV').subtract(image.select('VH'))
+        return rat.rename('VVminVH').set('system:time_start', image.get('system:time_start'))
+                                       
+    S1A_both = Ascending.select(['VV', 'VH']).sort('system:time_start')
+    S1A_both_filt = apply_speckle_filt(S1A_both)
+    
+    S1A_both_focal = focal_med_filt(S1A_both)
+    S1A_ratio_focal = S1A_both_focal.map(make_rat_filt)
+    S1A_ratio_focal = mask_invalid(S1A_ratio_focal, -5, 5)
+        
+    S1A_ratio = S1A_both.map(make_rat)
+    S1A_ratio_filt = S1A_both_filt.map(make_rat_filt)
+    S1A_ratio_filt = mask_invalid(S1A_ratio_filt, -5, 5)
+    S1A_dif = S1A_both.map(make_dif)
+    
+    return S1A_both, S1A_both_focal, S1A_both_filt, S1A_ratio, S1A_ratio_filt, S1A_ratio_focal
 
 #Translate to Gamma0
 def make_gamma0(image):
-  angle = image.select('angle').resample('bicubic')
-  return image.select('..').divide(angle.multiply(np.pi/180.0).cos()).copyProperties(image, ['system:time_start'])
+    angle = image.select('angle').resample('bicubic')
+    return image.select('..').divide(angle.multiply(np.pi/180.0).cos()).copyProperties(image, ['system:time_start'])
 
 #Edge masking with high/low angle
 def maskAngGT30(image):
@@ -953,6 +1316,10 @@ def maskAngGT30(image):
 def maskAngLT45(image):
     ang = image.select(['angle'])
     return image.updateMask(ang.lt(45.53993)) 
+
+def maskAngleGT40(image):
+    ang = image.select(['angle'])
+    return image.updateMask(ang.gt(40))
 
 # Some modified from here: https://code.earthengine.google.com/2ef38463ebaf5ae133a478f173fd0ab5 [Originally by Guido Lemoine]
 def toNatural(img):
@@ -1270,10 +1637,10 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None):
     serstd = pd.Series(out_std, index=out_dates)
     if save:
         df = pd.DataFrame({'mean':out_vals, 'std':out_std, 'time':out_dates})
-        df.to_csv(save + '.csv', index=False)
+        df.to_csv(save, index=False)
         print(save)
     return ser, serstd
-
+    
 def percentile_export(collection, percentile, clipper, aggregation_scale=30, save=None):
     '''
     Get a time series at a certain percentile
