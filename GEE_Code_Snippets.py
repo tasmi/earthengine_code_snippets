@@ -10,13 +10,46 @@ ee.Initialize()
 import numpy as np
 
 #%% General Helper Functions
-def run_export(image, crs, filename, scale, region, maxPixels=1e12, cloud_optimized=True):
+def run_export(image, crs, filename, scale, region, folder=None, maxPixels=1e12, cloud_optimized=True):
     '''
     Runs an export function on GEE servers
     '''
     task_config = {'fileNamePrefix': filename,'crs': crs,'scale': scale,'maxPixels': maxPixels, 'fileFormat': 'GeoTIFF', 'formatOptions': {'cloudOptimized': cloud_optimized}, 'region': region,}
+    if folder:
+        task_config['folder'] = folder
     task = ee.batch.Export.image.toDrive(image, filename, **task_config)
     task.start()
+    
+def export_collection(collection, region, prefix, crs=None, scale=100, max_images=None, folder=None):
+    '''
+    Exports all images within an image collection for a given region. All files named by a prefix (given)
+    and their image date (formated YYYYMMDD). 
+    region: area to export
+    prefix: file name prefix
+    crs: can be provided, or determined automatically
+    scale: output image pixel size in meters
+    max_images: number of images to export (e.g., maximum)
+    folder: if you want to store all images in a separate folder in your GDrive
+    '''
+    
+    nr_images = int(collection.size().getInfo())
+    print('Exporting %i Images' % nr_images)
+    
+    if not crs:
+        crs = collection.first().projection()
+    
+    image_list = collection.toList(nr_images)
+    
+    if max_images:
+        nr_images = max_images #Make sure not to export too many if you want to test something
+        
+    for i in range(nr_images):
+        image = ee.Image(image_list.get(i))
+        date = image.get('system:time_start')
+        date_name = ee.Date(date).format('YYYYMMdd').getInfo()
+        output_name = prefix + '_' + date_name + '_' + str(scale) + 'm.tif'
+        run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
+        print('Started export for image ' + str(i))
 
 def gee_geometry_from_shapely(geom, crs='epsg:4326'):
     """ 
