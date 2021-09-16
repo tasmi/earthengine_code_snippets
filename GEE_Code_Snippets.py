@@ -525,9 +525,6 @@ def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', ag
         return start.advance(t, timeframe)
     
     dates = length.map(gen_datelist)
-
-    #Get band name
-    bn = collection.first().bandNames().getInfo()[0]
     
     def create_sub_collections(t):
         t = ee.Date(t)
@@ -536,6 +533,14 @@ def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', ag
     
     mc = dates.map(create_sub_collections)
     mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
+    
+    #Get band name -- this covers for possible empty parts of the collection
+    bn = ee.Image(collection.reduce(ee.Reducer.mean())).bandNames().getInfo()
+    try:
+        bn = bn[0]
+    except:
+        bn = 'empty'
+    #print(bn)
 
     def reduceSum(filt_coll):
         filt_coll = ee.ImageCollection(filt_coll)
@@ -883,6 +888,7 @@ def to_percent(collection, threshold_min, threshold_max):
         #remap here to max of one
         rc = ee.Image(0).where(image.gt(threshold_min).And(image.lte(threshold_max)), 1)
         return rc
+    
     flt = collection.map(newbounds)
     su = flt.reduce(ee.Reducer.sum()).toFloat()
     ct = flt.reduce(ee.Reducer.count()).toFloat()
@@ -937,7 +943,7 @@ def two_band_reg(c1, c2, crs, name, polygon, scale=30):
     lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']]).select('trend')
     run_export(lrImage, crs, name + '_RobustLinReg', scale, polygon)
 
-def same_inst_twoband_reg(collection, crs, name, polygon, scale=30, export='Slope'):
+def same_inst_twoband_reg(collection, crs, name, polygon, scale=30, export='Slope', rmse=None, constant=True):
     '''
     Export can be 'Slope', 'Intercept', or 'Both'
     '''
@@ -946,16 +952,25 @@ def same_inst_twoband_reg(collection, crs, name, polygon, scale=30, export='Slop
     def createConstantBand(image):
         return ee.Image(1).addBands(image)
     
-    prepped = collection.map(createConstantBand)
-    
-    var = ee.List(['constant']).cat(bn)
-    
-    fit = prepped.select(var).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
-    lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']])
+    if constant:
+        prepped = collection.map(createConstantBand)
+        
+        var = ee.List(['constant']).cat(bn)
+        
+        fit = prepped.select(var).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
+        lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']])
+    else:
+        fit = collection.select(bn).reduce(ee.Reducer.robustLinearRegression(numX=1, numY=1))
+        lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['trend']])
     if export in ['Slope', 'Both']:
         run_export(lrImage.select('trend'), crs, name + '_RobustLinReg_slope', scale, polygon)
     if export in ['Intercept', 'Both']:
         run_export(lrImage.select('constant'), crs, name + '_RobustLinReg_intercept', scale, polygon)
+        
+    #Get the RMSE
+    if rmse:
+        lrImage = fit.select(['residuals']).arrayFlatten([['residuals']])
+        run_export(lrImage, crs, name + '_RobustLinReg_rmse', scale, polygon)
 
 #%% Data Import and Cleaning Functions
 ### GPM
@@ -1007,6 +1022,31 @@ def maskL8sr(image):
     mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0).And(qa.bitwiseAnd(cloudsBitMask).eq(0))
     return image.updateMask(mask)
 
+def maskL8toa_simple(image):
+    cloudsBitMask = (1 << 4)
+    #Get the pixel QA band.
+    qa = image.select('BQA')
+    #Both flags should be set to zero, indicating clear conditions.
+    mask = qa.bitwiseAnd(cloudsBitMask).eq(0)
+    return image.updateMask(mask)
+
+def maskL8toa(image):
+    #via: https://gis.stackexchange.com/questions/274612/apply-a-cloud-mask-to-a-landsat8-collection-in-google-earth-engine-time-series
+    #via: https://gis.stackexchange.com/questions/292835/using-cloud-confidence-to-create-cloud-mask-from-landsat-8-bqa
+    def extractQABits(qaBand, bitStart, bitEnd):
+        numBits = bitEnd - bitStart + 1
+        qaBits = qaBand.rightShift(bitStart).mod(2**numBits)
+        return qaBits
+    
+    qa_band = image.select('BQA')
+    cloud_shadow = extractQABits(qa_band, 7, 8)
+    mask_shadow = cloud_shadow.gte(2)
+    cloud = extractQABits(qa_band, 5, 6)
+    mask_cloud = cloud.gte(2)
+    
+    combined_mask = (cloud.Or(cloud_shadow))#.Not()
+    return image.updateMask(combined_mask)
+
 def cloudMaskL457(image):
     qa = image.select('pixel_qa')
     #If the cloud bit (5) is set and the cloud confidence (7) is high
@@ -1017,6 +1057,14 @@ def cloudMaskL457(image):
     return image.updateMask(cloud.Not()).updateMask(mask2)
 
 ### Sentinel-2
+def MSAVI_S2(image):
+    msavi2 = image.select('B8').multiply(2).add(1).subtract(image.select('B8').multiply(2).add(1).pow(2)\
+                .subtract(image.select('B8').subtract(image.select('B4')).multiply(8)).sqrt())\
+                .divide(2)\
+                .set('system:time_start', image.get('system:time_start'))\
+                .rename('MSAVI2')
+    return image.addBands(msavi2)
+
 def NDVI_S2(image):
     ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI').set('system:time_start', image.get('system:time_start'))
     return image.addBands(ndvi)
@@ -1059,10 +1107,10 @@ def L8_Temp(image):
     
     #Calc of LST
     thermal = image.select('B10').multiply(0.1)
-    LST = thermal.expression('(Tb/(1 + (0.00115* (Tb / 1.438))*log(Ep)))-273.15',\
+    LST = thermal.expression('(Tb/(1 + (0.00115* (Tb / 1.438))*log(Ep)))',\
                              {'Tb': thermal.select('B10'), \
                               'Ep': EM.select('EMM')}).rename('LST')
-    return LST.select('LST').set('system:time_start', image.get('system:time_start'))
+    return LST.select('LST').set('system:time_start', image.get('system:time_start')) #-273.15
 
 def focal_med_filt(collection, radius=100):
     ''' 
@@ -1075,6 +1123,22 @@ def focal_med_filt(collection, radius=100):
             sel = image.select(b)
             smoothed = sel.focal_median(radius, 'circle', 'meters')
             image = image.addBands(smoothed.rename(b + '_filt'))
+        return image
+    return collection.map(applyfx)
+    
+def focal_range_filt(collection, radius=1.5, radiustype='pixels', kernel='square'):
+    ''' 
+    Apply a focal range (max - min) filter to a selected band, with flexible radius
+    '''
+    bn = collection.first().bandNames().getInfo()
+    
+    def applyfx(image):
+        for b in bn:
+            sel = image.select(b)
+            ma = sel.focal_max(radius=radius, kernelType=kernel, units=radiustype)
+            mi = sel.focal_min(radius=radius, kernelType=kernel, units=radiustype)
+            dif = ma.subtract(mi)
+            image = image.addBands(dif.rename(b + '_range'))
         return image
     return collection.map(applyfx)
 
