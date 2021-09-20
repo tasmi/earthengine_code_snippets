@@ -1077,6 +1077,12 @@ def MNDWI_S2(image):
     ndwi = image.normalizedDifference(['B3', 'B11']).rename('MNDWI').set('system:time_start', image.get('system:time_start'))
     return image.addBands(ndwi)
 
+def LAI_S2(image):
+    #(5.405 * ((B8A - B5) / (B8A + B5))) - 0.114
+    calc = image.expression('(5.405 * ((B8A - B5) / (B8A + B5))) - 0.114', {'B8A': image.select('B8A'),'B5': image.select('B5')})
+    lai = calc.rename('LAI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(lai)
+
 def maskS2clouds(image):
     qa = image.select('QA60')
     
@@ -1691,11 +1697,11 @@ def apply_SG(collect, geom, window_size=7, imageAxis=0, bandAxis=1, order=3):
     return sg.filterMetadata('roi_min', 'not_equals', None).filterMetadata('roi_max', 'not_equals', None)
 
 #%% Conversion to Python Time Series
-def export_to_pandas(collection, clipper, aggregation_scale, save=None):
+def export_to_pandas(collection, clipper, aggregation_scale, save=None, med='median'):
     '''
     Takes an ImageCollection, an Earth Engine Geometry, and an aggregation scale (e.g., 30m for Landsat, 250m for MODIS, etc)
     
-    Returns a pandas time series for the mean and standard deviation values over the 
+    Returns a pandas time series for the mean/median and standard deviation values over the 
     aggregation area. 
     
     Optionally saves those time series to a CSV file    
@@ -1705,9 +1711,12 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None):
     
     def createTS(image):
         date = image.get('system:time_start')
-        value = image.reduceRegion(ee.Reducer.median(), clipper, aggregation_scale)
+        if med == 'median':
+            value = image.reduceRegion(ee.Reducer.median(), clipper, aggregation_scale)
+        elif med == 'mean':
+            value = image.reduceRegion(ee.Reducer.mean(), clipper, aggregation_scale)
         std = image.reduceRegion(ee.Reducer.stdDev(), clipper, aggregation_scale)
-        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mean': value, 'STD': std})
+        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mn': value, 'STD': std})
         return ft
     
     TS = collection.filterBounds(clipper).map(createTS)
@@ -1721,7 +1730,7 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None):
         props = f['properties']
         date = props['date']
         try:
-            val = list(props['Mean'].values())[0]
+            val = list(props['Mn'].values())[0]
         except:
             val = np.nan
         try:
@@ -1735,7 +1744,7 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None):
     ser = pd.Series(out_vals, index=out_dates)
     serstd = pd.Series(out_std, index=out_dates)
     if save:
-        df = pd.DataFrame({'mean':out_vals, 'std':out_std, 'time':out_dates})
+        df = pd.DataFrame({'mn':out_vals, 'std':out_std, 'time':out_dates})
         df.to_csv(save, index=False)
         print(save)
     return ser, serstd
