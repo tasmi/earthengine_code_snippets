@@ -39,19 +39,28 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
     image_list = collection.toList(nr_images)
     
     if max_images:
-        if max_image < nr_images:
+        if max_images < nr_images:
             nr_images = start_image + max_images #Make sure not to export too many if you want to test something
         else:
+            #If the number of images to export is less than the max_images, pass
             pass
         
-    print('Exporting %i Images' % nr_images)
+    print('Exporting up to %i Images' % nr_images)
     
     #Run a list from the starting image to the number you want
     for i in range(start_image, nr_images):
         if i >= start_image:
             image = ee.Image(image_list.get(i))
-            date = image.get('system:time_start')
-            date_name = ee.Date(date).format('YYYYMMdd').getInfo()
+            try:
+                #If there are defined start and end dates, add them to the file names
+                ds = image.get('sdate')
+                de = image.get('edate')
+                date_name0 = ee.Date(ds).format('YYYYMMdd').getInfo()
+                date_name1 = ee.Date(de).format('YYYYMMdd').getInfo()
+                date_name = date_name0 + '-' + date_name1
+            except:
+                date = image.get('system:time_start')
+                date_name = ee.Date(date).format('YYYYMMdd').getInfo()
             output_name = prefix + '_' + date_name + '_' + str(scale) + 'm.tif'
             run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
             print('Started export for image ' + str(i) + '(' + date_name + ')')
