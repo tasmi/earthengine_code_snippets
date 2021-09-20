@@ -39,7 +39,10 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
     image_list = collection.toList(nr_images)
     
     if max_images:
-        nr_images = start_image + max_images #Make sure not to export too many if you want to test something
+        if max_image < nr_images:
+            nr_images = start_image + max_images #Make sure not to export too many if you want to test something
+        else:
+            pass
         
     print('Exporting %i Images' % nr_images)
     
