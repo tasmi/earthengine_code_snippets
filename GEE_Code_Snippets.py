@@ -64,6 +64,34 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
             output_name = prefix + '_' + date_name + '_' + str(scale) + 'm.tif'
             run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
             print('Started export for image ' + str(i) + '(' + date_name + ')')
+            
+def build_collection_from_search(ic, searchranges, var, agg_fx):
+    '''
+    Given a set of date ranges (e.g., [start_date, end_date]), create an image collection that is 
+    one image per date range. Each image will have start and end dates as additional metadata.
+    The image will be single band if 'var' is one band, or multiband if var is of the form ['band1', 'band2', etc]
+    '''
+    def get_red(agg_fx):
+        '''Get a reducer from a dictionary'''
+        agg_dict = {'mn':ee.Reducer.mean(), 'max':ee.Reducer.max(), 'min':ee.Reducer.min(),\
+                   'sum':ee.Reducer.sum(), 'median':ee.Reducer.median()}
+        return agg_dict[agg_fx]
+        
+    merged_images = []
+    for i in searchranges:
+        ds, de = i
+        subcol = ic.filterDate(ds, de)
+        d = ee.Date(ds)
+        e = ee.Date(de)
+        agg = subcol.select(var).reduce(get_red(agg_fx))
+        agg = ee.Image(agg).set('system:time_start', d)
+        agg = ee.Image(agg).set('sdate', d)
+        agg = ee.Image(agg).set('edate', e)
+        merged_images.append(agg)
+    
+    #Turn them into a single imagecollection
+    output = ee.ImageCollection.fromImages(merged_images)
+    return output
 
 def gee_geometry_from_shapely(geom, crs='epsg:4326'):
     """ 
