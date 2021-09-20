@@ -121,6 +121,19 @@ def invert(image):
     ''' Invert an Image '''
     return image.multiply(-1)
 
+def get_ic_dates(ic):
+    '''
+    Get all of the dates in a given ImageCollection. Useful for finding unique sets
+    '''
+    def ret_date(image):
+        date = ee.Image(image).get('system:time_start')
+        d = ee.Date(date).format('Y/M/d')
+        return image.set('date', d)
+    
+    ic_d = ic.map(ret_date)
+    datelist = ee.List(ic_d.aggregate_array('date'))
+    return datelist
+
 #%% Time Series Functions
 def prevdif(collection):
     ''' 
