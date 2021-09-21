@@ -1094,7 +1094,7 @@ def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', co
         pctiles = ic.reduce(ee.Reducer.percentile([5,25,50,75,95]))
         return std, mn, pctiles
     
-    outname = name + '_n_iter=' + str(n_iter) + '_pct=' + str(sample_size).replace('.','')
+    outname = name + '_n_iter' + str(n_iter) + '_pct' + str(sample_size).replace('.','')
 
     if export in ['Slope', 'Both']:
         s, m, p = return_stats(slope_collection)
