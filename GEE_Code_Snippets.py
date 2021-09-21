@@ -1077,8 +1077,8 @@ def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', co
         return lrImage
     
     slopes, intercepts = [], []
-    for i in range(iter_nr):
-        filt = subsample(prepped, iter_nr)
+    for i in range(n_iter):
+        filt = subsample(prepped, i)
         lrImage = run_reg(filt)
         slopes.append(lrImage.select('trend'))
         intercepts.append(lrImage.select('constant'))
