@@ -1024,6 +1024,87 @@ def same_inst_twoband_reg(collection, crs, name, polygon, scale=30, export='Slop
     if rmse:
         lrImage = fit.select(['residuals']).arrayFlatten([['residuals']])
         run_export(lrImage, crs, name + '_RobustLinReg_rmse', scale, polygon)
+        
+def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', constant=True, n_iter=100, sample_size=0.75):
+    '''
+    Export can be 'Slope', 'Intercept', or 'Both'. Does a set n_iter using sample_size percent of the 
+    available DATES within a collection. This will work only if neighboring scenes aren't the same
+    date (e.g., you have filtered by path/row already). Otherwise the sampling percentages will be 
+    off due to multiple geographic regions having the same date!
+    '''
+    bn = collection.first().bandNames()
+    
+    def createConstantBand(image):
+        return ee.Image(1).addBands(image)
+    
+    prepped = collection.map(createConstantBand)
+    var = ee.List(['constant']).cat(bn)
+    
+    def subsample(ic, iter_nr):
+        def fmt(d):
+            #Reformat a date to EarthEngine standard
+            return d.strftime('%Y-%m-%d')
+            
+        #Get unique dates to use for the random sampling
+        UD = get_ic_dates(ic).getInfo()
+        UDS = pd.Series(range(len(UD)), index=UD)
+        ud = UDS.index.unique()
+    
+        #Get random selection of dates
+        r_sample = UDS.sample(frac=sample_size,random_state=iter_nr)
+        
+        #Go through each date and add it to a list of filters
+        flist = []
+        for date in r_sample.index:
+            date = pd.Timestamp(date)
+            sd, ed = fmt(date), fmt(date + pd.Timedelta('1 day'))
+            f = ee.Filter.date(sd, ed)
+            flist.append(f)
+            
+        #Merge all the filters with an 'or' to make the random subset
+        filt = ic.filter(ee.Filter.Or(flist))
+        
+        return filt
+    
+    def run_reg(ic):   
+        if constant:
+            fit = ic.select(var).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
+            lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']])
+        else:
+            fit = ic.select(bn).reduce(ee.Reducer.robustLinearRegression(numX=1, numY=1))
+            lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['trend']])
+            
+        return lrImage
+    
+    slopes, intercepts = [], []
+    for i in range(iter_nr):
+        filt = subsample(prepped, iter_nr)
+        lrImage = run_reg(filt)
+        slopes.append(lrImage.select('trend'))
+        intercepts.append(lrImage.select('constant'))
+        
+    slope_collection = ee.ImageCollection.fromImages(slopes)
+    intercept_collection = ee.ImageCollection.fromImages(intercepts)
+    
+    #Now get some statistics
+    def return_stats(ic):
+        std = ic.reduce(ee.Reducer.stdDev())
+        mn = ic.reduce(ee.Reducer.mean())
+        pctiles = ic.reduce(ee.Reducer.percentile([5,25,50,75,95]))
+        return std, mn, pctiles
+    
+    outname = name + '_n_iter=' + str(n_iter) + '_pct=' + str(sample_size.replace('.',''))
+
+    if export in ['Slope', 'Both']:
+        s, m, p = return_stats(slope_collection)
+        run_export(s, crs, outname + 'slopeSTD', scale, polygon)
+        run_export(m, crs, outname + 'slopeMN', scale, polygon)
+        run_export(p, crs, outname + 'slopePCT', scale, polygon)
+    if export in ['Intercept', 'Both']:
+        s, m, p = return_stats(intercept_collection)
+        run_export(s, crs, outname + 'intSTD', scale, polygon)
+        run_export(m, crs, outname + 'intMN', scale, polygon)
+        run_export(p, crs, outname + 'intPCT', scale, polygon)
 
 #%% Data Import and Cleaning Functions
 ### GPM
