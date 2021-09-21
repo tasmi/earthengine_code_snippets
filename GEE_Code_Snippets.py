@@ -1032,10 +1032,11 @@ def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', co
     date (e.g., you have filtered by path/row already). Otherwise the sampling percentages will be 
     off due to multiple geographic regions having the same date!
     '''
+    import pandas as pd
     bn = collection.first().bandNames()
     
     def createConstantBand(image):
-        return ee.Image(1).addBands(image)
+        return ee.Image(1).addBands(image).set('system:time_start', image.get('system:time_start'))
     
     prepped = collection.map(createConstantBand)
     var = ee.List(['constant']).cat(bn)
@@ -1050,12 +1051,12 @@ def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', co
         UDS = pd.Series(range(len(UD)), index=UD)
         ud = UDS.index.unique()
     
-        #Get random selection of dates
-        r_sample = UDS.sample(frac=sample_size,random_state=iter_nr)
+        #Get random selection of unique dates
+        r_sample = pd.Series(ud).sample(frac=sample_size,random_state=iter_nr)
         
         #Go through each date and add it to a list of filters
         flist = []
-        for date in r_sample.index:
+        for date in r_sample.values:
             date = pd.Timestamp(date)
             sd, ed = fmt(date), fmt(date + pd.Timedelta('1 day'))
             f = ee.Filter.date(sd, ed)
@@ -1093,7 +1094,7 @@ def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', co
         pctiles = ic.reduce(ee.Reducer.percentile([5,25,50,75,95]))
         return std, mn, pctiles
     
-    outname = name + '_n_iter=' + str(n_iter) + '_pct=' + str(sample_size.replace('.',''))
+    outname = name + '_n_iter=' + str(n_iter) + '_pct=' + str(sample_size).replace('.','')
 
     if export in ['Slope', 'Both']:
         s, m, p = return_stats(slope_collection)
@@ -1506,7 +1507,7 @@ def fix_S1(ds, de, polygon, flt=True, orbit=False, gamma=False, direction='Ascen
         #Choose the gamma bands and rename
         def rename(collection, which):
             def rnfx(image):
-                return image.rename(['VV', 'VH'])
+                return image.rename(['VV', 'VH']).set('system:time_start', image.get('system:time_start'))
             return collection.select(which).map(rnfx)            
                 
         data = rename(data, ['VV_gamma0', 'VH_gamma0'])
