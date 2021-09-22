@@ -1091,21 +1091,27 @@ def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', co
     def return_stats(ic):
         std = ic.reduce(ee.Reducer.stdDev())
         mn = ic.reduce(ee.Reducer.mean())
-        pctiles = ic.reduce(ee.Reducer.percentile([5,25,50,75,95]))
+        pctiles = []
+        for p in plist:
+            pct = ic.reduce(ee.Reducer.percentile([p]))
+            pctiles.append(p)
         return std, mn, pctiles
     
-    outname = name + '_n_iter' + str(n_iter) + '_pct' + str(sample_size).replace('.','')
+    plist = [5, 25, 50, 75, 95]
+    outname = name + '-n_iter' + str(n_iter) + '-pct' + str(sample_size).replace('.','')
 
     if export in ['Slope', 'Both']:
         s, m, p = return_stats(slope_collection)
         run_export(s, crs, outname + 'slopeSTD', scale, polygon)
         run_export(m, crs, outname + 'slopeMN', scale, polygon)
-        run_export(p, crs, outname + 'slopePCT', scale, polygon)
+        for i, pct in enumerate(plist):
+            run_export(p[i], crs, outname + 'slopePCT_p' + str(pct), scale, polygon)
     if export in ['Intercept', 'Both']:
         s, m, p = return_stats(intercept_collection)
         run_export(s, crs, outname + 'intSTD', scale, polygon)
         run_export(m, crs, outname + 'intMN', scale, polygon)
-        run_export(p, crs, outname + 'intPCT', scale, polygon)
+        for i, pct in enumerate(plist):
+            run_export(p[i], crs, outname + 'intPCT_p' + str(pct), scale, polygon)
 
 #%% Data Import and Cleaning Functions
 ### GPM
