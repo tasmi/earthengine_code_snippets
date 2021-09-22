@@ -1094,7 +1094,7 @@ def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', co
         pctiles = []
         for p in plist:
             pct = ic.reduce(ee.Reducer.percentile([p]))
-            pctiles.append(p)
+            pctiles.append(pct)
         return std, mn, pctiles
     
     plist = [5, 25, 50, 75, 95]
