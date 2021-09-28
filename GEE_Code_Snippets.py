@@ -20,10 +20,10 @@ def run_export(image, crs, filename, scale, region, folder=None, maxPixels=1e12,
     task = ee.batch.Export.image.toDrive(image, filename, **task_config)
     task.start()
     
-def export_collection(collection, region, prefix, crs=None, scale=100, start_image=0, max_images=None, folder=None):
+def export_collection(collection, region, prefix, crs=None, scale=100, start_image=0, max_images=None, folder=None, namelist=None):
     '''
     Exports all images within an image collection for a given region. All files named by a prefix (given)
-    and their image date (formated YYYYMMDD). 
+    and their image date (formatted YYYYMMDD). 
     region: area to export
     prefix: file name prefix
     crs: can be provided, or determined automatically
@@ -47,23 +47,32 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
         
     print('Exporting up to %i Images' % nr_images)
     
-    #Run a list from the starting image to the number you want
-    for i in range(start_image, nr_images):
-        if i >= start_image:
+    if namelist:
+        #Run through provided prefixes
+        for i, name in enumerate(namelist):
             image = ee.Image(image_list.get(i))
-            try:
-                #If there are defined start and end dates, add them to the file names
-                ds = image.get('sdate')
-                de = image.get('edate')
-                date_name0 = ee.Date(ds).format('YYYYMMdd').getInfo()
-                date_name1 = ee.Date(de).format('YYYYMMdd').getInfo()
-                date_name = date_name0 + '-' + date_name1
-            except:
-                date = image.get('system:time_start')
-                date_name = ee.Date(date).format('YYYYMMdd').getInfo()
-            output_name = prefix + '_' + date_name + '_' + str(scale) + 'm.tif'
+            output_name = prefix + '_' + name + '_' + str(scale) + 'm'
             run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
-            print('Started export for image ' + str(i) + '(' + date_name + ')')
+            print('Started export for image ' + str(i) + '(' + name + ')')
+            
+    else:
+        #Run a list from the starting image to the number you want
+        for i in range(start_image, nr_images):
+            if i >= start_image:
+                image = ee.Image(image_list.get(i))
+                try:
+                    #If there are defined start and end dates, add them to the file names
+                    ds = image.get('sdate')
+                    de = image.get('edate')
+                    date_name0 = ee.Date(ds).format('YYYYMMdd').getInfo()
+                    date_name1 = ee.Date(de).format('YYYYMMdd').getInfo()
+                    date_name = date_name0 + '-' + date_name1
+                except:
+                    date = image.get('system:time_start')
+                    date_name = ee.Date(date).format('YYYYMMdd').getInfo()
+                output_name = prefix + '_' + date_name + '_' + str(scale) + 'm.tif'
+                run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
+                print('Started export for image ' + str(i) + '(' + date_name + ')')
             
 def build_collection_from_search(ic, searchranges, var, agg_fx):
     '''
@@ -1184,6 +1193,23 @@ def maskL8toa(image):
     mask_shadow = cloud_shadow.gte(2)
     cloud = extractQABits(qa_band, 5, 6)
     mask_cloud = cloud.gte(2)
+    
+    combined_mask = (cloud.Or(cloud_shadow))#.Not()
+    return image.updateMask(combined_mask)
+
+def maskL57toa(image):
+    #via: https://gis.stackexchange.com/questions/274612/apply-a-cloud-mask-to-a-landsat8-collection-in-google-earth-engine-time-series
+    #via: https://gis.stackexchange.com/questions/292835/using-cloud-confidence-to-create-cloud-mask-from-landsat-8-bqa
+    #via: https://gis.stackexchange.com/questions/271483/how-to-apply-a-cloud-mask-in-google-earth-engine-landsat-5-tm-8-day-ndvi-compo
+    def extractQABits(qaBand, bitStart, bitEnd):
+        numBits = bitEnd - bitStart + 1
+        qaBits = qaBand.rightShift(bitStart).mod(2**numBits)
+        return qaBits
+    
+    qa_band = image.select('BQA')
+    cloud_shadow = extractQABits(qa_band, 7, 8)
+    cloud = extractQABits(qa_band, 4, 4)
+    mask_cloud = cloud.neq(1)
     
     combined_mask = (cloud.Or(cloud_shadow))#.Not()
     return image.updateMask(combined_mask)
