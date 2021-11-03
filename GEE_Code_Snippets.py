@@ -48,7 +48,7 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
     print('Exporting up to %i Images' % nr_images)
     
     if namelist:
-        #Run through provided prefixes
+        #Run through provided prefixes (e.g., one image for each month or year in a collection)
         for i, name in enumerate(namelist):
             image = ee.Image(image_list.get(i))
             output_name = prefix + '_' + name + '_' + str(scale) + 'm'
@@ -56,7 +56,7 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
             print('Started export for image ' + str(i) + '(' + name + ')')
             
     else:
-        #Run a list from the starting image to the number you want
+        #Run a list from the starting image to the number you want using the date of the image in the name
         for i in range(start_image, nr_images):
             if i >= start_image:
                 image = ee.Image(image_list.get(i))
@@ -68,9 +68,10 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
                     date_name1 = ee.Date(de).format('YYYYMMdd').getInfo()
                     date_name = date_name0 + '-' + date_name1
                 except:
+                    #Otherwise simply name by the image collection date
                     date = image.get('system:time_start')
                     date_name = ee.Date(date).format('YYYYMMdd').getInfo()
-                output_name = prefix + '_' + date_name + '_' + str(scale) + 'm.tif'
+                output_name = prefix + '_' + date_name + '_' + str(scale) + 'm'
                 run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
                 print('Started export for image ' + str(i) + '(' + date_name + ')')
             
@@ -182,6 +183,107 @@ def get_ic_dates(ic):
     ic_d = ic.map(ret_date)
     datelist = ee.List(ic_d.aggregate_array('date'))
     return datelist
+
+def rescale(ic, scale):
+    '''
+    Rescale all images in an image collection by a given scale factor. 
+    ASSUMES ALL BANDS SCALED EQUALLY
+    '''
+    def r(image):
+        return image.multiply(scale).set('system:time_start', image.get('system:time_start'))
+    return ic.map(r)
+
+def rename(ic, name):
+    '''
+    Rename all images in a collection to a specified new name.
+    '''
+    def rn(image):
+        return image.rename(name)
+    return ic.map(rn)
+
+def join_c(c1, c2, on='system:index'):
+    '''
+    Quick and dirty join on an arbitrary field. 
+    '''
+    filt = ee.Filter.equals(leftField=on, rightField=on) 
+    innerJoin = ee.Join.inner() #initialize the join
+    innerJoined = innerJoin.apply(c1, c2, filt) #This is a FEATURE COLLECTION
+    def combine_joined(feature):
+        return ee.Image.cat(feature.get('primary'), feature.get('secondary'))
+    
+    joined_collect = ee.ImageCollection(innerJoined.map(combine_joined))
+    return joined_collect
+
+def simple_difference(ic, b1, b2, outname='dif'):
+    '''
+    Simple difference between two bands in an image collection
+    '''
+    def sub(image):
+        i1 = image.select(b1)
+        i2 = image.select(b2)
+        return i1.subtract(i2).rename(outname)
+    return ic.map(sub)
+
+#%%
+def disentangle_to_daily(ic, ys, ye):
+    '''Convert 8-day data to monthly data'''
+    
+    def yearly_data(year):
+        return ic.filter(ee.Filter.calendarRange(year, year, 'year'))
+    
+    #years = ee.List(list(range(ys,ye)))
+    #yearly_ic = years.map(yearly_data)
+    
+    def create_image(date):
+        img = ee.Image(0).set('system:time_start', date)
+        return img
+    
+    ly = list(range(1960,2028,4))
+    
+    daily_data = []
+    for yr in range(ys,ye+1):
+        yearly_ic = yearly_data(yr)
+        yearly_ic_list = ee.ImageCollection.toList(yearly_ic, yearly_ic.size())
+        
+        if yr in ly:
+            nr_days = 366
+        else:
+            nr_days = 365
+        
+        #Create empty images for each day of the year
+        t0 = ee.Date(str(yr) + '-01-01')
+        days = ee.List([t0.advance(x,'day') for x in range(0,nr_days)])
+        images = ee.ImageCollection(days.map(create_image))
+        
+        def add_to_images(images, ds, de, avg):
+            subset = images.filterDate(ds, de)
+            def add(image):
+                return image.add(avg).set('system:time_start', image.get('system:time_start'))
+            return subset.map(add)
+        
+        #Get the image for each 8-day period
+        nr_images = ee.Number(yearly_ic.size())
+        nr_images_local = nr_images.getInfo()
+        for i in range(nr_images_local):
+            data = yearly_ic_list.get(i)
+            
+            if not i == nr_images_local-1:
+                avg = ee.Image(data).divide(8)
+            else:
+                if nr_days == 366:
+                    avg = ee.Image(data).divide(6)
+                else:
+                    avg = ee.Image(data).divide(5)
+            
+            ds = t0.advance(i*8, 'day')
+            de = t0.advance((i+1)*8, 'day')
+            updated_images = add_to_images(images, ds, de, avg)
+            daily_data.append(updated_images)
+        
+    output = daily_data[0]
+    for i in daily_data[1:]:
+        output = output.merge(i)
+    return output
 
 #%% Time Series Functions
 def prevdif(collection):
@@ -296,7 +398,7 @@ def Rolling_LinearFit(collection, windowSize=17):
     
     #First get the band name of the given Input ImageCollection
     img = collection.first()
-    bn = img.bandNames().getInfo()[0]
+    bn = img.bandNames()#.getInfo()[0]
     
     #Add a time band
     def add_time(img):
@@ -358,7 +460,7 @@ def fit_harmonic(collection):
 
     #Get the name of the image band
     img = collection.first()
-    bn = img.bandNames().getInfo()[0]
+    bn = img.bandNames()#.getInfo()[0]
     def add_harm_terms(image):
         #Add harmonic terms as new image bands.
         timeRadians = image.select('t').multiply(2 * np.pi)
@@ -429,7 +531,7 @@ def fit_multi_harmonic(collection, harmonics=3):
 
     #Get the name of the image band
     img = collection.first()
-    bn = img.bandNames().getInfo()[0]
+    bn = img.bandNames()#.getInfo()[0]
 
     #Get list of harmonic terms
     harmonicFrequencies = list(range(1, harmonics+1))#ee.List.sequence(1, harmonics)
@@ -527,7 +629,7 @@ def fit_multi_harmonic(collection, harmonics=3):
     #Divide the summed images and subtract from 1 for a classic RSQ value
     rsq = ee.Image(1).subtract(sum_resids.divide(sum_sqtot)).rename('RSQ')
 
-    return [fittedHarmonic.select('fitted'), multiphase, multiamp, rsq]
+    return fittedHarmonic.select('fitted'), multiphase, multiamp, rsq
 
 #%% Data Aggregation Functions
 def match_time_sampling(collection1, collection2, ds, de, reducer):
@@ -563,6 +665,17 @@ def match_time_sampling(collection1, collection2, ds, de, reducer):
     
     return ee.ImageCollection(agged)  
 
+def lt_monthly_mean(ic):
+    '''
+    Long-term average for each month of a given image collection.
+    '''
+    def apply_filt(m):
+        filt = ic.filter(ee.Filter.calendarRange(m, m, 'month'))
+        return filt.reduce(ee.Reducer.mean()).set('month', m)
+    l = ee.List([1,2,3,4,5,6,7,8,9,10,11,12])
+    monthly_means = l.map(apply_filt)
+    return monthly_means
+
 def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', agg_var=None):
     '''
     Take an ImageCollection and convert it into an aggregated value based on an arbitrary function.
@@ -597,7 +710,7 @@ def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', ag
     mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
     
     #Get band name -- this covers for possible empty parts of the collection
-    bn = ee.Image(collection.reduce(ee.Reducer.mean())).bandNames().getInfo()
+    bn = ee.Image(collection.reduce(ee.Reducer.mean())).bandNames()#.getInfo()
     try:
         bn = bn[0]
     except:
@@ -772,7 +885,7 @@ def windowed_difference_date(collection, ds, de, window_size, window_unit):
 
 def reduceFit(collection):
     t = collection.get('system:time_start')
-    bn = collection.first().bandNames().getInfo()[0]
+    bn = collection.first().bandNames()#.getInfo()[0]
     def createTimeBand(image):
         date = ee.Date(image.get('system:time_start'))
         years = date.difference(ee.Date('1970-01-01'), 'month')
@@ -795,7 +908,7 @@ def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
     
     dates = length.map(gen_datelist)
 
-    bn = collection.first().bandNames().getInfo()[0]
+    bn = collection.first().bandNames()#.getInfo()[0]
     
     def create_sub_collections(t):
         t = ee.Date(t)
@@ -1261,8 +1374,13 @@ def maskS2clouds(image):
     mask = qa.bitwiseAnd(cloudBitMask).eq(0).And(qa.bitwiseAnd(cirrusBitMask).eq(0))
     return image.updateMask(mask).divide(10000).set('system:time_start', image.get('system:time_start'))
 
-def rescale_modis(image):
-    return image.multiply(0.0001).set('system:time_start', image.get('system:time_start'))
+def rescale(ic, sf):
+    '''
+    Rescale all images in a collection by a given scale factor (sf)
+    '''
+    def app(image):
+        return image.multiply(sf).set('system:time_start', image.get('system:time_start'))
+    return ic.map(app)
 
 def L8_Temp(image):
     #Get Fractional Veg
@@ -1289,7 +1407,7 @@ def focal_med_filt(collection, radius=100):
     ''' 
     Apply a focal median filter to a selected band, with flexible radius
     '''
-    bn = collection.first().bandNames().getInfo()
+    bn = collection.first().bandNames()#.getInfo()
     
     def applyfx(image):
         for b in bn:
@@ -1303,7 +1421,7 @@ def focal_range_filt(collection, radius=1.5, radiustype='pixels', kernel='square
     ''' 
     Apply a focal range (max - min) filter to a selected band, with flexible radius
     '''
-    bn = collection.first().bandNames().getInfo()
+    bn = collection.first().bandNames()#.getInfo()
     
     def applyfx(image):
         for b in bn:
@@ -1697,7 +1815,7 @@ def RefinedLee(img):
     return result
 
 def apply_speckle_filt(collection):
-    bn = collection.first().bandNames().getInfo()
+    bn = collection.first().bandNames()#.getInfo()
     def applyfx(image):
         for b in bn:
             nat = toNatural(image.select(b)) #Convert to log scale
