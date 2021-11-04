@@ -398,7 +398,7 @@ def Rolling_LinearFit(collection, windowSize=17):
     
     #First get the band name of the given Input ImageCollection
     img = collection.first()
-    bn = img.bandNames()#.getInfo()[0]
+    bn = img.bandNames().getInfo()[0]
     
     #Add a time band
     def add_time(img):
@@ -460,7 +460,7 @@ def fit_harmonic(collection):
 
     #Get the name of the image band
     img = collection.first()
-    bn = img.bandNames()#.getInfo()[0]
+    bn = img.bandNames().getInfo()[0]
     def add_harm_terms(image):
         #Add harmonic terms as new image bands.
         timeRadians = image.select('t').multiply(2 * np.pi)
@@ -531,7 +531,7 @@ def fit_multi_harmonic(collection, harmonics=3):
 
     #Get the name of the image band
     img = collection.first()
-    bn = img.bandNames()#.getInfo()[0]
+    bn = img.bandNames().getInfo()[0]
 
     #Get list of harmonic terms
     harmonicFrequencies = list(range(1, harmonics+1))#ee.List.sequence(1, harmonics)
@@ -710,7 +710,7 @@ def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', ag
     mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
     
     #Get band name -- this covers for possible empty parts of the collection
-    bn = ee.Image(collection.reduce(ee.Reducer.mean())).bandNames()#.getInfo()
+    bn = ee.Image(collection.reduce(ee.Reducer.mean())).bandNames().getInfo()
     try:
         bn = bn[0]
     except:
@@ -885,7 +885,7 @@ def windowed_difference_date(collection, ds, de, window_size, window_unit):
 
 def reduceFit(collection):
     t = collection.get('system:time_start')
-    bn = collection.first().bandNames()#.getInfo()[0]
+    bn = collection.first().bandNames().getInfo()[0]
     def createTimeBand(image):
         date = ee.Date(image.get('system:time_start'))
         years = date.difference(ee.Date('1970-01-01'), 'month')
@@ -908,7 +908,7 @@ def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
     
     dates = length.map(gen_datelist)
 
-    bn = collection.first().bandNames()#.getInfo()[0]
+    bn = collection.first().bandNames().getInfo()[0]
     
     def create_sub_collections(t):
         t = ee.Date(t)
@@ -1407,7 +1407,7 @@ def focal_med_filt(collection, radius=100):
     ''' 
     Apply a focal median filter to a selected band, with flexible radius
     '''
-    bn = collection.first().bandNames()#.getInfo()
+    bn = collection.first().bandNames().getInfo()
     
     def applyfx(image):
         for b in bn:
@@ -1421,7 +1421,7 @@ def focal_range_filt(collection, radius=1.5, radiustype='pixels', kernel='square
     ''' 
     Apply a focal range (max - min) filter to a selected band, with flexible radius
     '''
-    bn = collection.first().bandNames()#.getInfo()
+    bn = collection.first().bandNames().getInfo()
     
     def applyfx(image):
         for b in bn:
@@ -1815,7 +1815,7 @@ def RefinedLee(img):
     return result
 
 def apply_speckle_filt(collection):
-    bn = collection.first().bandNames()#.getInfo()
+    bn = collection.first().bandNames().getInfo()
     def applyfx(image):
         for b in bn:
             nat = toNatural(image.select(b)) #Convert to log scale
