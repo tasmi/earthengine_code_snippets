@@ -1235,6 +1235,41 @@ def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', co
         for i, pct in enumerate(plist):
             run_export(p[i], crs, outname + 'intPCT_p' + str(pct), scale, polygon)
 
+def otsu(histogram, fixed=False):
+    #This function takes a histogram and provides the proper threshold for splitting it into two components.
+    #Implementation modified from: https://medium.com/google-earth/otsus-method-for-image-segmentation-f5c48f405e
+    if not fixed:
+        #E.g., reducer=ee.Reducer.histogram(255,2)
+        counts = ee.Array(ee.Dictionary(histogram).get('histogram'))
+        means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'))
+    else:
+        #E.g., reducer=ee.Reducer.fixedHistogram(min_bin, max_bin, steps)
+        both = ee.Array(histogram).transpose()
+        means = ee.Array(both.toList().get(0))
+        counts = ee.Array(both.toList().get(1))
+    size = means.length().get([0])
+    total = counts.reduce(ee.Reducer.sum(), [0]).get([0])
+    sum_ = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0])
+    mean = sum_.divide(total);
+
+    indices = ee.List.sequence(1, size)
+
+    #Compute between sum of squares, where each mean partitions the data.
+    def iterate(i):
+        aCounts = counts.slice(0, 0, i)
+        aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0])
+        aMeans = means.slice(0, 0, i)
+        aMean = aMeans.multiply(aCounts)\
+            .reduce(ee.Reducer.sum(), [0]).get([0])\
+            .divide(aCount)
+        bCount = total.subtract(aCount)
+        bMean = sum_.subtract(aCount.multiply(aMean)).divide(bCount)
+        return aCount.multiply(aMean.subtract(mean).pow(2)).add(bCount.multiply(bMean.subtract(mean).pow(2)))
+    bss = indices.map(iterate)
+
+    #Return the mean value corresponding to the maximum BSS.
+    return means.sort(bss).get([-1])
+
 #%% Data Import and Cleaning Functions
 ### GPM
 def mask_GPM(image):
