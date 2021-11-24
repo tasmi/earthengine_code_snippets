@@ -198,7 +198,7 @@ def rename(ic, name):
     Rename all images in a collection to a specified new name.
     '''
     def rn(image):
-        return image.rename(name)
+        return ee.Image(image).rename(name)
     return ic.map(rn)
 
 def join_c(c1, c2, on='system:index'):
