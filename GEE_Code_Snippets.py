@@ -277,6 +277,7 @@ def get_local_utm(geometry):
     '''
     def choose_utm_zone(geometry):
         ''' Generate an EPSG code for UTM projection for a given lat/lon '''
+        import math
         lon = geometry.centroid.x
         lat = geometry.centroid.y
 
