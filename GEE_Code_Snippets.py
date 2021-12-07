@@ -19,7 +19,7 @@ def run_export(image, crs, filename, scale, region, folder=None, maxPixels=1e12,
         task_config['folder'] = folder
     task = ee.batch.Export.image.toDrive(image, filename, **task_config)
     task.start()
-    
+        
 def export_collection(collection, region, prefix, crs=None, scale=100, start_image=0, max_images=None, folder=None, namelist=None):
     '''
     Exports all images within an image collection for a given region. All files named by a prefix (given)
@@ -118,6 +118,29 @@ def gee_geometry_from_shapely(geom, crs='epsg:4326'):
         return ee.Geometry.MultiPolygon(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)
     elif ty == 'MultiPoint':
         return ee.Geometry.MultiPoint(ee.List(mapping(geom)['coordinates']), proj=crs)
+    
+def geopandas_to_earthengine(gdf, crs='epsg:4326'):
+    '''
+    Helper to quickly create a set of earth engine geometries from a geodataframe
+    '''
+    feats = []
+    for _, i in gdf.iterrows():
+        ee_geom = gee_geometry_from_shapely(i.geometry, crs=crs)
+        atts = i.to_dict()
+        del atts['geometry'] #Make sure geometry isn't duplicated
+        feats.append(ee.Feature(ee_geom, atts))
+    
+    return ee.FeatureCollection(feats)
+
+def export_features(fc, filename, folder=None, output_format='CSV'):
+    '''
+    Runs an export function on GEE servers for feature (tabular) data. Can also export GeoJSON.
+    '''
+    task_config = {'fileNamePrefix': filename, 'fileFormat': output_format}
+    if folder:
+        task_config['folder'] = folder
+    task = ee.batch.Export.table.toDrive(fc, filename, **task_config)
+    task.start()
     
 def customRemap(image, lowerLimit, upperLimit, newValue):
     mask = image.gt(lowerLimit).And(image.lte(upperLimit))
@@ -221,12 +244,59 @@ def simple_difference(ic, b1, b2, outname='dif'):
     def sub(image):
         i1 = image.select(b1)
         i2 = image.select(b2)
-        return i1.subtract(i2).rename(outname)
+        return i1.subtract(i2).rename(outname).set('system:time_start', image.get('system:time_start'))
     return ic.map(sub)
+
+def rolling_apply(ic, windowsize, fx, var=None):
+    '''
+    Apply a function over a moving window (windowsize is in days)
+    '''
+    if var:
+        ic = ic.select(var)
+
+    def apply_roller(dates, fx):
+        def roller(t):
+            t = ee.Date(t) #Get the date
+            #Use the date to create a search window of windowSize in both directions
+            window = ic.filterDate(t.advance(-windowsize,'day'),t.advance(windowsize,'day'))
+            
+            #Apply the function
+            return fx(window)
+        
+        vals = dates.map(roller)
+        return vals
+    
+    dates = ee.List(ic.aggregate_array('system:time_start'))
+    vals = apply_roller(dates, fx)
+    
+    return ee.ImageCollection.fromImages(vals)
+
+def get_local_utm(geometry):
+    '''
+    Take a given geometry (geometry object) and get the local UTM code as a EE Projection
+    '''
+    def choose_utm_zone(geometry):
+        ''' Generate an EPSG code for UTM projection for a given lat/lon '''
+        lon = geometry.Centroid().GetX()
+        lat = geometry.Centroid().GetY()
+
+        #https://gis.stackexchange.com/questions/269518/auto-select-suitable-utm-zone-based-on-grid-intersection
+        utm_band = str(int(math.floor((lon + 180) / 6 ) % 60) + 1)
+        if len(utm_band) == 1:
+            utm_band = '0' + utm_band
+        if lat >= 0:
+            epsg_code = '326' + utm_band
+        else:
+            epsg_code = '327' + utm_band
+
+        return int(float(epsg_code))
+    
+    epsg_code = choose_utm_zone(geometry)
+    return ee.Projection('epsg:' + str(epsg_code)) #Turn it into an earth-engine projection
 
 #%%
 def disentangle_to_daily(ic, ys, ye):
-    '''Convert 8-day data to monthly data'''
+    '''Convert 8-day data to daily data'''
     
     def yearly_data(year):
         return ic.filter(ee.Filter.calendarRange(year, year, 'year'))
@@ -240,6 +310,7 @@ def disentangle_to_daily(ic, ys, ye):
     
     ly = list(range(1960,2028,4))
     
+    ys, ye = int(ys), int(ye)
     daily_data = []
     for yr in range(ys,ye+1):
         yearly_ic = yearly_data(yr)
@@ -630,6 +701,60 @@ def fit_multi_harmonic(collection, harmonics=3):
     rsq = ee.Image(1).subtract(sum_resids.divide(sum_sqtot)).rename('RSQ')
 
     return fittedHarmonic.select('fitted'), multiphase, multiamp, rsq
+
+def moving_harmonic(ic, start_year, end_year, fit_period=3, harmonic_order=3):
+    '''
+    Fit a harmonic in multiple parts -- can be done year by year, or by fitting the harmonics to a 
+    given multi-year time window. Fit period must be odd (or zero)!
+    '''
+    
+    #Get the length of the sides from the fitting period
+    len_sides = int((fit_period - 1) / 2)
+    
+    def create_yearlist(yr, len_sides):
+        '''
+        Create a list of years based on years before/after a given center year
+        '''
+        yearlist = [yr]
+        for i in range(1,len_sides+1):
+            yearlist.append(yr - i)
+            yearlist.append(yr + i)
+        yearlist.sort()
+        return yearlist
+    
+    def multi_year_data(yearlist):
+        '''
+        For a list of years, return only that subset of the data
+        '''
+        flist = []
+        for year in yearlist:
+            flist.append(ee.Filter.calendarRange(year, year, 'year'))
+        if len(flist) == 1:
+            filt = flist[0]
+        else:
+            filt = ee.Filter.Or(flist)
+        return filt
+    
+    output = []
+    for year in range(start_year, end_year + 1):
+        #Get this list of years to use as a filter
+        yearlist = create_yearlist(year, len_sides)
+        filt = multi_year_data(yearlist)
+        
+        #Subset the data and fit a harmonic of given order
+        subset = ic.filter(filt)
+        harmonic, phase, amplitude, rsq = fit_multi_harmonic(subset, harmonic_order)
+        
+        #Retain only the given year
+        filt = ee.Filter.calendarRange(year, year, 'year')
+        harmonic_year = harmonic.filter(filt)
+        output.append(harmonic_year)
+    
+    #Merge the years of data back together
+    base = output[0]
+    for i in output[1:]:
+        base = base.merge(i)
+    return base
 
 #%% Data Aggregation Functions
 def match_time_sampling(collection1, collection2, ds, de, reducer):
@@ -1278,13 +1403,22 @@ def mask_GPM(image):
     return precip_filt
 
 ### Landsat
+def applyScaleFactors(image):
+    opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2)
+    thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0)
+    return image.addBands(opticalBands).addBands(thermalBands).set('system:time_start', image.get('system:time_start'))
+
 def NDSI_L7(image):
-    ndvi = image.normalizedDifference(['B2', 'B5']).rename('NDSI').set('system:time_start', image.get('system:time_start'))
-    return image.addBands(ndvi)
+    ndsi = image.normalizedDifference(['B2', 'B5']).rename('NDSI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(ndsi)
 
 def NDSI_L8(image):
-    ndvi = image.normalizedDifference(['B3', 'B6']).rename('NDSI').set('system:time_start', image.get('system:time_start'))
-    return image.addBands(ndvi)
+    ndsi = image.normalizedDifference(['B3', 'B6']).rename('NDSI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(ndsi)
+
+def NDSI_L8_C2(image):
+    ndsi = image.normalizedDifference(['SR_B3', 'SR_B6']).rename('NDSI').set('system:time_start', image.get('system:time_start'))
+    return image.addBands(ndsi)
 
 def NDVI_L7(image):
     ndvi = image.normalizedDifference(['B4', 'B3']).rename('NDVI').set('system:time_start', image.get('system:time_start'))
@@ -1318,6 +1452,17 @@ def maskL8sr(image):
     qa = image.select('pixel_qa')
     #Both flags should be set to zero, indicating clear conditions.
     mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0).And(qa.bitwiseAnd(cloudsBitMask).eq(0))
+    return image.updateMask(mask)
+
+def mask_landsat_c2(image):
+    #Bits 3 and 5 are cloud shadow and cloud, respectively.
+    cloudShadowBitMask = (1 << 3)
+    cloudsBitMask = (1 << 4)
+    cirrusBitMask = (1 << 2)
+    #Get the pixel QA band.
+    qa = image.select('QA_PIXEL')
+    #Both flags should be set to zero, indicating clear conditions.
+    mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0).And(qa.bitwiseAnd(cloudsBitMask).eq(0)).And(qa.bitwiseAnd(cirrusBitMask).eq(0))
     return image.updateMask(mask)
 
 def maskL8toa_simple(image):
