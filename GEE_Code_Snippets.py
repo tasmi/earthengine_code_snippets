@@ -277,8 +277,8 @@ def get_local_utm(geometry):
     '''
     def choose_utm_zone(geometry):
         ''' Generate an EPSG code for UTM projection for a given lat/lon '''
-        lon = geometry.Centroid().GetX()
-        lat = geometry.Centroid().GetY()
+        lon = geometry.centroid.x
+        lat = geometry.centroid.y
 
         #https://gis.stackexchange.com/questions/269518/auto-select-suitable-utm-zone-based-on-grid-intersection
         utm_band = str(int(math.floor((lon + 180) / 6 ) % 60) + 1)
