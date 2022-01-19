@@ -19,6 +19,28 @@ def run_export(image, crs, filename, scale, region, folder=None, maxPixels=1e12,
         task_config['folder'] = folder
     task = ee.batch.Export.image.toDrive(image, filename, **task_config)
     task.start()
+    
+def export_timeseries_todrive(collection, filename, scale, region, folder=None, agg_fx=ee.Reducer.median()):
+    '''
+    Runs an export function on GEE servers
+    '''
+    
+    #Create the time series
+    import pandas as pd, numpy as np
+    
+    def createTS(image):
+        date = image.get('system:time_start')
+        value = image.reduceRegion(agg_fx, region, scale)
+        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'val': value})
+        return ft
+    
+    TS = collection.filterBounds(region).map(createTS)
+    
+    task_config = {'description': filename, 'fileFormat': 'CSV'}
+    if folder:
+        task_config['folder'] = folder
+    task = ee.batch.Export.table.toDrive(TS, **task_config)
+    task.start()
         
 def export_collection(collection, region, prefix, crs=None, scale=100, start_image=0, max_images=None, folder=None, namelist=None):
     '''
@@ -207,13 +229,13 @@ def get_ic_dates(ic):
     datelist = ee.List(ic_d.aggregate_array('date'))
     return datelist
 
-def rescale(ic, scale):
+def rescale(ic, scale, add=0):
     '''
-    Rescale all images in an image collection by a given scale factor. 
+    Rescale all images in an image collection by a given scale factor and addative factor. 
     ASSUMES ALL BANDS SCALED EQUALLY
     '''
     def r(image):
-        return image.multiply(scale).set('system:time_start', image.get('system:time_start'))
+        return image.multiply(scale).add(add).set('system:time_start', image.get('system:time_start'))
     return ic.map(r)
 
 def rename(ic, name):
@@ -509,7 +531,7 @@ def Rolling_LinearFit(collection, windowSize=17):
     return smoothed
 
 #%% Harmonic Fitting Functions
-def fit_harmonic(collection):
+def fit_harmonic(collection, bn=None):
     """
     Function to fit a simple harmonic model to an ImageCollection. Uses only one harmonic with a frequency of 
     one calendar year. Original function adapted from:
@@ -531,8 +553,10 @@ def fit_harmonic(collection):
         return image.addBands(ee.Image(years).rename('t')).float().addBands(ee.Image.constant(1))
 
     #Get the name of the image band
-    img = collection.first()
-    bn = img.bandNames().getInfo()[0]
+    if not bn:
+        img = collection.first()
+        bn = img.bandNames().getInfo()[0]
+        
     def add_harm_terms(image):
         #Add harmonic terms as new image bands.
         timeRadians = image.select('t').multiply(2 * np.pi)
@@ -589,7 +613,7 @@ def fit_harmonic(collection):
     return [fittedHarmonic.select('fitted'), phase.select('phase').toFloat(), \
             amplitude.select('amplitude').toFloat(), rsq.select('RSQ').toFloat()]
 
-def fit_multi_harmonic(collection, harmonics=3):
+def fit_multi_harmonic(collection, harmonics=3, bn=None):
     """
     Function to fit a complex harmonic model to an ImageCollection. Uses any number of desired harmonics. 
     Original function adapted from:
@@ -602,8 +626,9 @@ def fit_multi_harmonic(collection, harmonics=3):
     import numpy as np
 
     #Get the name of the image band
-    img = collection.first()
-    bn = img.bandNames().getInfo()[0]
+    if not bn:
+        img = collection.first()
+        bn = img.bandNames().getInfo()[0]
 
     #Get list of harmonic terms
     harmonicFrequencies = list(range(1, harmonics+1))#ee.List.sequence(1, harmonics)
@@ -703,7 +728,7 @@ def fit_multi_harmonic(collection, harmonics=3):
 
     return fittedHarmonic.select('fitted'), multiphase, multiamp, rsq
 
-def moving_harmonic(ic, start_year, end_year, fit_period=3, harmonic_order=3):
+def moving_harmonic(ic, start_year, end_year, bn=None, fit_period=3, harmonic_order=3):
     '''
     Fit a harmonic in multiple parts -- can be done year by year, or by fitting the harmonics to a 
     given multi-year time window. Fit period must be odd (or zero)!
@@ -744,7 +769,7 @@ def moving_harmonic(ic, start_year, end_year, fit_period=3, harmonic_order=3):
         
         #Subset the data and fit a harmonic of given order
         subset = ic.filter(filt)
-        harmonic, phase, amplitude, rsq = fit_multi_harmonic(subset, harmonic_order)
+        harmonic, phase, amplitude, rsq = fit_multi_harmonic(subset, harmonics=harmonic_order, bn=bn)
         
         #Retain only the given year
         filt = ee.Filter.calendarRange(year, year, 'year')
@@ -1405,9 +1430,9 @@ def mask_GPM(image):
 
 ### Landsat
 def applyScaleFactors(image):
-    opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2)
-    thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0)
-    return image.addBands(opticalBands).addBands(thermalBands).set('system:time_start', image.get('system:time_start'))
+    opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2).float()
+    thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0).float()
+    return image.addBands(opticalBands, overwrite=True).addBands(thermalBands, overwrite=True).set('system:time_start', image.get('system:time_start'))
 
 def NDSI_L7(image):
     ndsi = image.normalizedDifference(['B2', 'B5']).rename('NDSI').set('system:time_start', image.get('system:time_start'))
