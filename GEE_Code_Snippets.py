@@ -42,7 +42,8 @@ def export_timeseries_todrive(collection, filename, scale, region, folder=None, 
     task = ee.batch.Export.table.toDrive(TS, **task_config)
     task.start()
         
-def export_collection(collection, region, prefix, crs=None, scale=100, start_image=0, max_images=None, folder=None, namelist=None):
+def export_collection(collection, region, prefix, crs=None, scale=100, start_image=0, \
+                      max_images=None, folder=None, namelist=None):
     '''
     Exports all images within an image collection for a given region. All files named by a prefix (given)
     and their image date (formatted YYYYMMDD). 
@@ -96,7 +97,22 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
                 output_name = prefix + '_' + date_name + '_' + str(scale) + 'm'
                 run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
                 print('Started export for image ' + str(i) + '(' + date_name + ')')
+       
             
+def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny=-80, maxy=80, step=20, **kwaargs):
+    '''
+    Split a large (e.g., global) job into smaller pieces. Can help with memory issues/speed of processing.
+    '''
+    if not crs:
+        crs = ee.Projection('EPSG:4326')
+    for i in range(minx,maxx,step):
+        for j in range(miny,maxy,step):
+            name = namebase + '_%i_%i_%i_%i_WGS84' % (i,i+step,j,j+step)
+    
+            print('Starting', name)
+            roi = ee.Geometry.Polygon([[i, j], [i, j+step], [i+step, j+step], [i+step, j]])
+            run_export(image, crs=crs, filename=name, region=roi, scale=scale, **kwaargs)
+        
 def build_collection_from_search(ic, searchranges, var, agg_fx):
     '''
     Given a set of date ranges (e.g., [start_date, end_date]), create an image collection that is 
@@ -121,7 +137,7 @@ def build_collection_from_search(ic, searchranges, var, agg_fx):
         agg = ee.Image(agg).set('edate', e)
         merged_images.append(agg)
     
-    #Turn them into a single imagecollection
+    #Turn them into a single ImageCollection
     output = ee.ImageCollection.fromImages(merged_images)
     return output
 
@@ -295,10 +311,11 @@ def rolling_apply(ic, windowsize, fx, var=None):
 
 def get_local_utm(geometry):
     '''
-    Take a given geometry (geometry object) and get the local UTM code as a EE Projection
+    Take a given geometry (shapely geometry object) and get the local UTM code as a EE Projection.
+    NOTE: Works on/off-line in tandem, so cannot be mapped over an image collection!
     '''
     def choose_utm_zone(geometry):
-        ''' Generate an EPSG code for UTM projection for a given lat/lon '''
+        ''' Generate an EPSG code for UTM projection for a given lat/lon'''
         import math
         lon = geometry.centroid.x
         lat = geometry.centroid.y
@@ -316,6 +333,36 @@ def get_local_utm(geometry):
     
     epsg_code = choose_utm_zone(geometry)
     return ee.Projection('epsg:' + str(epsg_code)) #Turn it into an earth-engine projection
+
+def get_utm_from_image(image):
+    '''
+    Use an image's geometry to get the proper UTM zone. Useful for processing large batches
+    of Landsat/Sentinel data that all have different projections over a large area.
+    Returns ee projection item.
+    NOTE: This is all done server-side, so can be used within .map() functions without an issue!
+    '''
+    fp = ee.Geometry(image.get('system:footprint'))
+    ct = fp.centroid().coordinates()
+    lon, lat = ee.Number(ct.get(0)), ee.Number(ct.get(1)) #x,y
+    
+    #utm_band = str(int(math.floor((lon + 180) / 6 ) % 60) + 1)
+    
+    step1 = lon.add(180).divide(6).floor()
+    step2 = step1.mod(60).add(1)
+    utm_band = ee.Number(step2).int().format('%s')
+    
+    #if len(utm_band) == 1:
+    #    utm_band = ee.String('0').cat(utm_band)
+    #if lat >= 0:
+    #    epsg_code = ee.String('326').cat(utm_band)
+    #else:
+    #    epsg_code = ee.String('327').cat(utm_band)
+    
+    #NOTE: THIS DOESNT SUPPORT POLAR COORDINATE SYSTEMS RIGHT NOW
+    epsg_code = ee.Algorithms.If(lat.gte(0), ee.String('326').cat(utm_band), ee.String('327').cat(utm_band))
+    
+    proj = ee.Projection(ee.String('epsg:').cat(ee.String(epsg_code)))
+    return proj
 
 #%%
 def disentangle_to_daily(ic, ys, ye):
@@ -555,7 +602,8 @@ def fit_harmonic(collection, bn=None):
     #Get the name of the image band
     if not bn:
         img = collection.first()
-        bn = img.bandNames().getInfo()[0]
+        #bn = img.bandNames().getInfo()[0]
+        bn = img.bandNames().get(0)
         
     def add_harm_terms(image):
         #Add harmonic terms as new image bands.
@@ -628,7 +676,8 @@ def fit_multi_harmonic(collection, harmonics=3, bn=None):
     #Get the name of the image band
     if not bn:
         img = collection.first()
-        bn = img.bandNames().getInfo()[0]
+        #bn = img.bandNames().getInfo()[0]
+        bn = img.bandNames().get(0)
 
     #Get list of harmonic terms
     harmonicFrequencies = list(range(1, harmonics+1))#ee.List.sequence(1, harmonics)
@@ -2126,6 +2175,86 @@ def NBMI(collection):
     
     return ee.ImageCollection.fromImages(ic_diff)
 
+#%% Quick and dirty filtering
+def mask_images(ic, maskband, maskbit):
+    '''
+    Quick and dirty masking for MODIS data (or other simple contexts where the first QA bit is general)
+    '''
+    def mask_(image):
+        qc = (1 << maskbit) #Bit 0 is the general quality flag
+        qa = image.select(maskband) #Get the pixel QA band.
+        mask = qa.bitwiseAnd(qc).eq(0)
+        return image.updateMask(mask)
+    return ic.map(mask_)
+
+def std_filter(ic, threshold=3):
+    '''
+    Filter out very high/low values based on std from the mean
+    '''
+    mean = ic.reduce(ee.Reducer.mean())
+    std = ic.reduce(ee.Reducer.stdDev())
+    mx = mean.add(std.multiply(threshold))
+    mn = mean.subtract(std.multiply(threshold))
+    
+    def mask_(image):
+        mask = image.gt(mx)
+        mask2 = image.lt(mn)
+        combined_mask = (mask.Or(mask2)).Not()
+        return image.updateMask(combined_mask).set('system:time_start', image.get('system:time_start'))
+    
+    return ic.map(mask_)
+
+def add_constant(ic, constant=5):
+    '''
+    Add a constant to an ImageCollection
+    '''
+    def add_(image):
+        return image.add(constant).set('system:time_start', image.get('system:time_start'))
+    return ic.map(add_)
+
+def check_filter_size(orig_ic, filt_ic):
+    '''
+    Check how much of the data is filtered by a given original and filtered collection.
+    NOTE: This also works to check for MASKING -- not just removal of images  
+        (e.g., masked pixels aren't included in the count)
+    Returns a ratio normalized by the size of the input collection
+    '''
+    ct1 = ee.Image(orig_ic.count())
+    ct2 = ee.Image(filt_ic.count())
+    dif = ct1.subtract(ct2) #Dif between raw and filtered
+    rat = ee.Image(1).subtract(dif.divide(ct1)) #Normalize by number of measurements
+    return rat
+
+def assess_fit(orig_ic, fitted_ic, bn=None):
+    '''
+    Check how well a model fits to the original data. Returns an RSQ value.
+    '''
+    #Get the input band name
+    if not bn:
+        img = orig_ic.first()
+        bn = img.bandNames().get(0)
+    
+    #Get Model fit
+    def distance_to_orig(image):
+        resids = image.select('fitted').subtract(image.select(bn))
+        ss_res = resids.pow(ee.Number(2)).rename('SumSQ')
+        dist_mean = image.select(bn).subtract(mn)
+        ss_tot = dist_mean.pow(ee.Number(2)).rename('DistMean')
+        #rsq = 1 - (ss_res / ss_tot)
+        
+        return image.addBands(ss_res).addBands(ss_tot)
+    
+    mn = orig_ic.reduce(ee.Reducer.mean())
+    distfit = fitted_ic.map(distance_to_orig)
+    
+    #Sum of Resids
+    sum_resids = distfit.select('SumSQ').reduce(ee.Reducer.sum())
+    sum_sqtot = distfit.select('DistMean').reduce(ee.Reducer.sum())
+    
+    #Divide the summed images and subtract from 1 for a classic RSQ value
+    rsq = ee.Image(1).subtract(sum_resids.divide(sum_sqtot)).rename('RSQ')
+    return rsq
+
 #%% Online Filtering
 def apply_SG(collect, geom, window_size=7, imageAxis=0, bandAxis=1, order=3):
     '''
@@ -2188,7 +2317,7 @@ def apply_SG(collect, geom, window_size=7, imageAxis=0, bandAxis=1, order=3):
     return sg.filterMetadata('roi_min', 'not_equals', None).filterMetadata('roi_max', 'not_equals', None)
 
 #%% Conversion to Python Time Series
-def export_to_pandas(collection, clipper, aggregation_scale, save=None, med='median'):
+def export_to_pandas(collection, clipper, aggregation_scale, med='median', save_std=True):
     '''
     Takes an ImageCollection, an Earth Engine Geometry, and an aggregation scale (e.g., 30m for Landsat, 250m for MODIS, etc)
     
@@ -2206,8 +2335,13 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None, med='med
             value = image.reduceRegion(ee.Reducer.median(), clipper, aggregation_scale)
         elif med == 'mean':
             value = image.reduceRegion(ee.Reducer.mean(), clipper, aggregation_scale)
-        std = image.reduceRegion(ee.Reducer.stdDev(), clipper, aggregation_scale)
-        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mn': value, 'STD': std})
+        else:
+            value = image.reduceRegion(med, clipper, aggregation_scale)
+        if save_std:
+            std = image.reduceRegion(ee.Reducer.stdDev(), clipper, aggregation_scale)
+            ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mn': value, 'STD': std})
+        else:
+            ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mn': value})
         return ft
     
     TS = collection.filterBounds(clipper).map(createTS)
@@ -2224,21 +2358,22 @@ def export_to_pandas(collection, clipper, aggregation_scale, save=None, med='med
             val = list(props['Mn'].values())[0]
         except:
             val = np.nan
-        try:
-            std = list(props['STD'].values())[0]
-        except:
-            std = np.nan
         out_vals[i] = val
-        out_std[i] = std
+        
+        if save_std:
+            try:
+                std = list(props['STD'].values())[0]
+            except:
+                std = np.nan
+            out_std[i] = std
         out_dates.append(pd.Timestamp(date))
     
     ser = pd.Series(out_vals, index=out_dates)
-    serstd = pd.Series(out_std, index=out_dates)
-    if save:
-        df = pd.DataFrame({'mn':out_vals, 'std':out_std, 'time':out_dates})
-        df.to_csv(save, index=False)
-        print(save)
-    return ser, serstd
+    if save_std:
+        serstd = pd.Series(out_std, index=out_dates)
+        return ser, serstd
+    else:
+        return ser
     
 def percentile_export(collection, percentile, clipper, aggregation_scale=30, save=None):
     '''
@@ -2275,7 +2410,6 @@ def percentile_export(collection, percentile, clipper, aggregation_scale=30, sav
         df.to_csv(save + '.csv', index=False)
         print(save)
     return ser
-
 
 #%% Short Example
 # minx2, maxx2 = 18, 20
