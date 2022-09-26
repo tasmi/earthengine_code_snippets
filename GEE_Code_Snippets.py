@@ -76,7 +76,7 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
             image = ee.Image(image_list.get(i))
             output_name = prefix + '_' + name + '_' + str(scale) + 'm'
             run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
-            print('Started export for image ' + str(i) + '(' + name + ')')
+            print('Started export for image ' + str(i) + ' (' + name + ')')
             
     else:
         #Run a list from the starting image to the number you want using the date of the image in the name
@@ -210,7 +210,6 @@ def apply_mask(collection, mask):
     '''
     Simple function to apply a static mask to all images in a collection
     '''
-    
     def apply_fx(image):
         return image.updateMask(mask)
     return collection.map(apply_fx)
@@ -285,7 +284,7 @@ def simple_difference(ic, b1, b2, outname='dif'):
         return i1.subtract(i2).rename(outname).set('system:time_start', image.get('system:time_start'))
     return ic.map(sub)
 
-def rolling_apply(ic, windowsize, fx, var=None):
+def rolling_apply(ic, windowSize, fx, var=None, ts='year'):
     '''
     Apply a function over a moving window (windowsize is in days)
     '''
@@ -296,17 +295,17 @@ def rolling_apply(ic, windowsize, fx, var=None):
         def roller(t):
             t = ee.Date(t) #Get the date
             #Use the date to create a search window of windowSize in both directions
-            window = ic.filterDate(t.advance(-windowsize,'day'),t.advance(windowsize,'day'))
+            window = ic.filterDate(t.advance(-windowSize,ts),t.advance(windowSize,ts))
             
             #Apply the function
-            return fx(window)
+            result = fx(window)
+            return result
         
         vals = dates.map(roller)
         return vals
     
     dates = ee.List(ic.aggregate_array('system:time_start'))
     vals = apply_roller(dates, fx)
-    
     return ee.ImageCollection.fromImages(vals)
 
 def get_local_utm(geometry):
@@ -363,6 +362,9 @@ def get_utm_from_image(image):
     
     proj = ee.Projection(ee.String('epsg:').cat(ee.String(epsg_code)))
     return proj
+
+def createConstantBand(image):
+    return ee.Image(1).addBands(image).set('system:time_start', image.get('system:time_start'))
 
 #%%
 def disentangle_to_daily(ic, ys, ye):
@@ -539,7 +541,7 @@ def Rolling_LinearFit(collection, windowSize=17):
     
     #First get the band name of the given Input ImageCollection
     img = collection.first()
-    bn = img.bandNames().getInfo()[0]
+    bn = img.bandNames().get(0)
     
     #Add a time band
     def add_time(img):
@@ -910,7 +912,7 @@ def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', ag
     mc_filt = mc.filter(ee.Filter.gt('bandcount',0))
     
     #Get band name -- this covers for possible empty parts of the collection
-    bn = ee.Image(collection.reduce(ee.Reducer.mean())).bandNames().getInfo()
+    bn = ee.Image(collection.reduce(ee.Reducer.mean())).bandNames().get(0)#.getInfo()
     try:
         bn = bn[0]
     except:
@@ -1085,7 +1087,7 @@ def windowed_difference_date(collection, ds, de, window_size, window_unit):
 
 def reduceFit(collection):
     t = collection.get('system:time_start')
-    bn = collection.first().bandNames().getInfo()[0]
+    bn = collection.first().bandNames().get(0)#.getInfo()[0]
     def createTimeBand(image):
         date = ee.Date(image.get('system:time_start'))
         years = date.difference(ee.Date('1970-01-01'), 'month')
@@ -1108,7 +1110,7 @@ def windowed_monthly_agg(collection, ds, de, window=1, agg_fx='sum'):
     
     dates = length.map(gen_datelist)
 
-    bn = collection.first().bandNames().getInfo()[0]
+    bn = collection.first().bandNames().get(0)#.getInfo()[0]
     
     def create_sub_collections(t):
         t = ee.Date(t)
@@ -1346,6 +1348,27 @@ def same_inst_twoband_reg(collection, crs, name, polygon, scale=30, export='Slop
     if rmse:
         lrImage = fit.select(['residuals']).arrayFlatten([['residuals']])
         run_export(lrImage, crs, name + '_RobustLinReg_rmse', scale, polygon)
+        
+def linearFit_time(collection, unit='year'):
+    bn = collection.first().bandNames()
+    
+    def createTimeBand(image):
+        date = ee.Date(image.get('system:time_start'))
+        td = date.difference(ee.Date('1970-01-01'), unit)
+        return image.addBands(ee.Image(td).rename('t')).set('system:time_start', image.get('system:time_start'))
+    
+    def recast(image):
+        return image.float().set('system:time_start', image.get('system:time_start'))
+    
+    prepped = collection.map(createConstantBand).map(recast)
+    prepped2 = prepped.map(createTimeBand).map(recast)
+    
+    var = ee.List(['constant', 't']).cat(bn)
+        
+    fit = prepped2.select(var).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1))
+    lrImage = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']])
+
+    return lrImage.select('trend'), fit.select(['residuals']).arrayFlatten([['residuals']])
         
 def bootstrap_slope(collection, crs, name, polygon, scale=30, export='Slope', constant=True, n_iter=100, sample_size=0.75):
     '''
@@ -1629,14 +1652,6 @@ def maskS2clouds(image):
     mask = qa.bitwiseAnd(cloudBitMask).eq(0).And(qa.bitwiseAnd(cirrusBitMask).eq(0))
     return image.updateMask(mask).divide(10000).set('system:time_start', image.get('system:time_start'))
 
-def rescale(ic, sf):
-    '''
-    Rescale all images in a collection by a given scale factor (sf)
-    '''
-    def app(image):
-        return image.multiply(sf).set('system:time_start', image.get('system:time_start'))
-    return ic.map(app)
-
 def L8_Temp(image):
     #Get Fractional Veg
     ndvi = image.normalizedDifference(['B5', 'B4']).rename('NDVI').select('NDVI')
@@ -1662,7 +1677,7 @@ def focal_med_filt(collection, radius=100):
     ''' 
     Apply a focal median filter to a selected band, with flexible radius
     '''
-    bn = collection.first().bandNames().getInfo()
+    bn = collection.first().bandNames().get(0)#.getInfo()
     
     def applyfx(image):
         for b in bn:
@@ -1676,7 +1691,7 @@ def focal_range_filt(collection, radius=1.5, radiustype='pixels', kernel='square
     ''' 
     Apply a focal range (max - min) filter to a selected band, with flexible radius
     '''
-    bn = collection.first().bandNames().getInfo()
+    bn = collection.first().bandNames().get(0)#.getInfo()
     
     def applyfx(image):
         for b in bn:
@@ -1962,7 +1977,7 @@ def maskAngLT45(image):
     ang = image.select(['angle'])
     return image.updateMask(ang.lt(45.53993)) 
 
-def maskAngleGT40(image):
+def maskAngGT40(image):
     ang = image.select(['angle'])
     return image.updateMask(ang.gt(40))
 
@@ -1977,6 +1992,8 @@ def RefinedLee(img):
     '''
     Refined Lee Speckle Filter
     NOTE: img must be in natural units, i.e. not in dB!
+    
+    NOTE: Final output may need to be flattened, depending on usage. See here: https://developers.google.cn/earth-engine/guides/arrays_array_images
     '''
     #Set up 3x3 kernels 
     weights3 = ee.List.repeat(ee.List.repeat(1,3),3)
@@ -1986,7 +2003,7 @@ def RefinedLee(img):
     variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3)
 
     #Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
-    sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]])
+    sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]])
 
     sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, False)
 
@@ -2070,7 +2087,7 @@ def RefinedLee(img):
     return result
 
 def apply_speckle_filt(collection):
-    bn = collection.first().bandNames().getInfo()
+    bn = collection.first().bandNames().get(0)#.getInfo()
     def applyfx(image):
         for b in bn:
             nat = toNatural(image.select(b)) #Convert to log scale
@@ -2410,6 +2427,29 @@ def percentile_export(collection, percentile, clipper, aggregation_scale=30, sav
         df.to_csv(save + '.csv', index=False)
         print(save)
     return ser
+
+#%%
+def deseason_data(ic, mode='complex', start_year=2001, end_year=2022, fit_period=3, harmonic_order=3):
+    #Detrend the data
+    detrend_ic = detrend(ic)
+    
+    #Get seasonality information
+    if mode == 'simple':
+        harmonic, _, _, _ = fit_multi_harmonic(detrend_ic, harmonic_order=harmonic_order)
+    elif mode == 'complex':
+        harmonic = moving_harmonic(detrend_ic, start_year, end_year, fit_period=fit_period, harmonic_order=harmonic_order)
+    
+    #Rename the detrended data as dt
+    dt = rename(detrend_ic, 'dt')
+    
+    #Get seasonality via harmonics
+    seasonality = rename(harmonic, 'seas')
+    
+    #Subtract the seasonal signal from the detrended signal to produce the final residuals
+    joint_vals = join_c(dt, seasonality, on='system:time_start')
+    deseasoned = simple_difference(joint_vals, 'dt', 'seas')
+    
+    return deseasoned
 
 #%% Short Example
 # minx2, maxx2 = 18, 20
