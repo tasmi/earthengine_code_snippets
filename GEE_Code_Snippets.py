@@ -8,6 +8,7 @@ Created on Tue Jul 14 11:16:43 2020
 import ee
 ee.Initialize()
 import numpy as np
+import os
 
 #%% General Helper Functions
 def run_export(image, crs, filename, scale, region, folder=None, maxPixels=1e12, cloud_optimized=True):
@@ -24,10 +25,7 @@ def export_timeseries_todrive(collection, filename, scale, region, folder=None, 
     '''
     Runs an export function on GEE servers
     '''
-    
-    #Create the time series
-    import pandas as pd, numpy as np
-    
+    #Create the time series    
     def createTS(image):
         date = image.get('system:time_start')
         value = image.reduceRegion(agg_fx, region, scale)
@@ -98,8 +96,7 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
                 run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
                 print('Started export for image ' + str(i) + '(' + date_name + ')')
        
-            
-def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny=-80, maxy=80, step=20, **kwaargs):
+def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny=-80, maxy=80, step=20, gdrive=None, folder=None, **kwaargs):
     '''
     Split a large (e.g., global) job into smaller pieces. Can help with memory issues/speed of processing.
     '''
@@ -107,11 +104,25 @@ def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny
         crs = ee.Projection('EPSG:4326')
     for i in range(minx,maxx,step):
         for j in range(miny,maxy,step):
-            name = namebase + '_%i_%i_%i_%i_WGS84' % (i,i+step,j,j+step)
+            imax = i + step
+            jmax = j + step
+            if jmax > maxy:
+                jmax = maxy
+            if imax > maxx:
+                imax = maxx
+            name = namebase + '_%i_%i_%i_%i_WGS84' % (i,imax,j,jmax)
     
-            print('Starting', name)
-            roi = ee.Geometry.Polygon([[i, j], [i, j+step], [i+step, j+step], [i+step, j]])
-            run_export(image, crs=crs, filename=name, region=roi, scale=scale, **kwaargs)
+            roi = ee.Geometry.Polygon([[i, j], [i, jmax], [imax, jmax], [imax, j]])
+            if gdrive:
+                if os.path.exists(gdrive + folder + '/' + name + '.tif'):
+                    print(gdrive + folder + '/' + name + '.tif exists in gdrive!')
+                    pass
+                else:
+                    print('Starting', name)
+                    run_export(image, crs=crs, filename=name, region=roi, scale=scale, folder=folder, **kwaargs)
+            else:
+                print('Starting', name)
+                run_export(image, crs=crs, filename=name, region=roi, scale=scale, folder=folder, **kwaargs)
         
 def build_collection_from_search(ic, searchranges, var, agg_fx):
     '''
@@ -244,6 +255,19 @@ def get_ic_dates(ic):
     datelist = ee.List(ic_d.aggregate_array('date'))
     return datelist
 
+def reduce_res(ic, out_crs, scale, agg_fx):
+    ''' Change the scale of an image based on a given agg_fx (mean, mode, etc)'''
+    def red_(image):
+        #input_crs = image.projection()
+        reduce_image = image.reduceResolution(reducer=agg_fx, maxPixels=65535)
+        return reduce_image.reproject(crs=out_crs, scale=scale).set('system:time_start', image.get('system:time_start'))
+    return ic.map(red_)
+
+def reduce_imageres(image, out_crs, scale, agg_fx):
+    ''' Change the scale of an image based on a given agg_fx (mean, mode, etc)'''
+    reduce_image = image.reduceResolution(reducer=agg_fx, maxPixels=65535)
+    return reduce_image.reproject(crs=out_crs, scale=scale).set('system:time_start', image.get('system:time_start'))
+
 def rescale(ic, scale, add=0):
     '''
     Rescale all images in an image collection by a given scale factor and addative factor. 
@@ -261,9 +285,18 @@ def rename(ic, name):
         return ee.Image(image).rename(name)
     return ic.map(rn)
 
+def join_fc(f1, f2, on):
+    '''
+    Quick and dirty join of feature collections on an arbitrary field. 
+    '''
+    Filter = ee.Filter.equals(leftField=on, rightField=on)
+    simpleJoin = ee.Join.simple()
+    simpleJoined = simpleJoin.apply(f1, f2, Filter)
+    return simpleJoined
+
 def join_c(c1, c2, on='system:index'):
     '''
-    Quick and dirty join on an arbitrary field. 
+    Quick and dirty join of Image Collections on an arbitrary field. 
     '''
     filt = ee.Filter.equals(leftField=on, rightField=on) 
     innerJoin = ee.Join.inner() #initialize the join
@@ -281,7 +314,7 @@ def simple_difference(ic, b1, b2, outname='dif'):
     def sub(image):
         i1 = image.select(b1)
         i2 = image.select(b2)
-        return i1.subtract(i2).rename(outname).set('system:time_start', image.get('system:time_start'))
+        return i1.subtract(i2).rename(outname).set('system:time_start', image.get('system:time_start')).set('system:footprint', image.get('system:footprint'))
     return ic.map(sub)
 
 def rolling_apply(ic, windowSize, fx, var=None, ts='year'):
@@ -478,6 +511,172 @@ def windowed_difference(collection, window):
     windif = seq.map(windif_fx)
     
     return ee.ImageCollection.fromImages(windif)
+
+def piecewise_detrend(ic, start_year, end_year, fit_period=3):
+    #Get the length of the sides from the fitting period
+    len_sides = int((fit_period - 1) / 2)
+    
+    def create_yearlist(yr, len_sides):
+        '''
+        Create a list of years based on years before/after a given center year
+        '''
+        yearlist = [yr]
+        for i in range(1,len_sides+1):
+            yearlist.append(yr - i)
+            yearlist.append(yr + i)
+        yearlist.sort()
+        return yearlist
+    
+    def multi_year_data(yearlist):
+        '''
+        For a list of years, return only that subset of the data
+        '''
+        flist = []
+        for year in yearlist:
+            flist.append(ee.Filter.calendarRange(year, year, 'year'))
+        if len(flist) == 1:
+            filt = flist[0]
+        else:
+            filt = ee.Filter.Or(flist)
+        return filt
+    
+    output = []
+    for year in range(start_year, end_year + 1):
+        #Get this list of years to use as a filter
+        yearlist = create_yearlist(year, len_sides)
+        filt = multi_year_data(yearlist)
+        
+        #Subset the data and fit a harmonic of given order
+        subset = ic.filter(filt)
+        
+        #Detrend that subset
+        subset_dt = detrend(subset)
+        
+        #Retain only the given year
+        filt = ee.Filter.calendarRange(year, year, 'year')
+        dt_year = subset_dt.filter(filt)
+        output.append(dt_year)
+    
+    #Merge the years of data back together
+    base = output[0]
+    for i in output[1:]:
+        base = base.merge(i)
+    return base
+
+def detrend_nonlin(collection, order=3):    
+    def addVariables(image):
+        date = ee.Date(image.get('system:time_start'))
+        years = date.difference(ee.Date('1970-01-01'), 'year')
+        t = ee.Image(years).rename('t')
+        t2 = ee.Image(years).pow(ee.Image(2)).rename('t2').toFloat()
+        t3 = ee.Image(years).pow(ee.Image(3)).rename('t3').toFloat()
+        t4 = ee.Image(years).pow(ee.Image(4)).rename('t4').toFloat()
+        t5 = ee.Image(years).pow(ee.Image(5)).rename('t5').toFloat()
+        t6 = ee.Image(years).pow(ee.Image(6)).rename('t6').toFloat()
+        t7 = ee.Image(years).pow(ee.Image(7)).rename('t7').toFloat()
+        t8 = ee.Image(years).pow(ee.Image(8)).rename('t8').toFloat()
+        return image.addBands(ee.Image.constant(1)).addBands(t).addBands(t2)\
+                .addBands(t3).addBands(t4).addBands(t5).addBands(t6).addBands(t7).addBands(t8).float()
+
+    idps = ['constant', 't', 't2', 't3', 't4', 't5', 't6', 't7', 't8']
+    idps = idps[:order+1]
+    independents = ee.List(idps)
+    img = collection.first()
+    bn = img.bandNames().get(0)
+    dependent = ee.String(bn)
+    
+    coll = collection.map(addVariables)
+    
+    #Compute a linear trend.  This will have two bands: 'residuals' and 
+    #a 2x1 band called coefficients (columns are for dependent variables).
+    trend = coll.select(independents.add(dependent)).reduce(ee.Reducer.linearRegression(independents.length(), 1))
+    
+    #Flatten the coefficients into a 2-band image
+    coefficients = trend.select('coefficients').arrayProject([0]).arrayFlatten([independents])
+    
+    #Compute a de-trended series.
+    def remove_trend(image):
+        detrended = image.select(dependent).subtract(image.select(independents).multiply(coefficients).reduce('sum'))\
+            .rename('detrend').copyProperties(image, ['system:time_start'])
+        return image.addBands(detrended)
+    
+    detrended = coll.map(remove_trend)
+    return detrended.select('detrend')
+
+def rolling_detrend(ic, fit_period=5, window_unit='year', var=None):
+    '''
+    Apply a function over a moving window
+    '''
+    if var:
+        ic = ic.select(var)
+        
+    if window_unit == 'year':
+        fit_period = fit_period * 365
+        window_unit = 'day'
+
+    len_sides = int((fit_period - 1) / 2)
+
+    def apply_roller(dates):
+        def roller(t):
+            t = ee.Date(t) #Get the date
+            #Use the date to create a search window of windowSize in both directions
+            window = ic.filterDate(t.advance(-len_sides,window_unit),t.advance(len_sides,window_unit))
+            
+            #Detrend over that window
+            dt = detrend(window)
+            
+            #Select only the center date
+            img = ee.Image(dt.filterDate(t).first())
+            
+            return img.set('system:time_start', t).rename('dt').float()
+        
+        vals = dates.map(roller)
+        return vals
+    
+    dates = ee.List(ic.aggregate_array('system:time_start'))
+    vals = apply_roller(dates)
+    
+    return ee.ImageCollection.fromImages(vals)
+
+def deseason_data(ic, bn=None, detrend_type='moving', deseason=True, detrend_fit_period=5, harmonic='single', start_year=2000, end_year=2022, \
+                  harmonic_fit_period=3, harmonic_order=3):
+    '''
+    Top-level for de-seasoning data. Takes multiple options for detrending and deseasoning. 
+    '''
+    if not bn:
+        img = ic.first()
+        bn = img.bandNames().get(0)
+     
+    #Get rid of linear trends
+    if detrend_type == 'single':
+        detrend_ic = detrend(ic) #This is a simple non-moving detrender
+    elif detrend_type == 'moving':
+        detrend_ic = piecewise_detrend(ic, start_year, end_year, detrend_fit_period) #Fit 5-year ramps to detrend, three years for harmonics
+    else:
+        detrend_ic = ic
+        
+    if deseason:
+        #Find the seasonal component
+        if harmonic == 'single':
+            harmonic, _, _, _ = fit_multi_harmonic(detrend_ic, harmonics=harmonic_order)
+        elif harmonic == 'moving':
+            harmonic = moving_harmonic(detrend_ic, start_year, end_year, fit_period=harmonic_fit_period, harmonic_order=harmonic_order)
+
+        #Rename the detrended data as dt
+        dt = rename(detrend_ic, 'dt')
+
+        #Get seasonality via harmonics
+        seasonality = rename(harmonic, 'seas')
+
+        #Subtract the seasonal signal from the detrended signal to produce the final residuals
+        joint_vals = join_c(dt, seasonality, on='system:time_start')
+        deseasoned = simple_difference(joint_vals, 'dt', 'seas')
+
+        deseasoned = rename(deseasoned, 'ds')
+    else:
+        deseasoned = rename(detrend_ic, 'ds')
+    
+    return deseasoned
     
 def detrend(collection, return_detrend=False):
     """ 
@@ -506,7 +705,7 @@ def detrend(collection, return_detrend=False):
     
     #Compute a linear trend.  This will have two bands: 'residuals' and 
     #a 2x1 band called coefficients (columns are for dependent variables).
-    trend = coll.select(independents.add(dependent)).reduce(ee.Reducer.linearRegression(independents.length(), 1))
+    trend = coll.select(independents.add(dependent)).reduce(ee.Reducer.linearRegression(independents.length(), 1), 4)
     
     #Flatten the coefficients into a 2-band image
     coefficients = trend.select('coefficients').arrayProject([0]).arrayFlatten([independents])
@@ -525,6 +724,44 @@ def detrend(collection, return_detrend=False):
     else:
         #Default returns only the detrended data
         return detrended.select('detrend')
+    
+def annual_trend(ic, mask=None, first_year=1999, last_year=2023, robust=True, var='median', reducer=ee.Reducer.median()): #Takes in deseasoned/detrended data!
+    save = []
+    for yr in range(first_year, last_year):
+        sy, ey = yr, yr + 1 
+        sd, ed = ee.Date(str(sy) + '-10-01'), ee.Date(str(ey) + '-10-01') #Clip out water-years (oct-oct)
+        subset = ic.filterDate(sd, ed)
+        out_date = ee.Date(str(ey) + '-04-01')
+        
+        #Get the median for that year
+        mn = subset.reduce(reducer).rename(var).set('system:time_start', out_date).float()
+        if mask:
+            mn = mn.updateMask(mask)
+        
+        #Create a constant to make regressions with later
+        const = ee.Image.constant(1).rename('constant').set('system:time_start', out_date).float()
+        base_yr = ee.Image(yr).rename('year').set('system:time_start', out_date).float() #Scale to make regression more stable      
+        
+        #Create one multiband image
+        output = const.addBands(base_yr).addBands(mn)
+        if mask:
+            output = output.updateMask(mask)
+        save.append(output.set('system:time_start', out_date))
+    
+    #Turn everything into a single collection
+    save = ee.ImageCollection.fromImages(save)
+    
+    #Now do some regressions
+    if robust:
+        fit = save.select(['constant', 'year', var]).reduce(ee.Reducer.robustLinearRegression(numX=2, numY=1), 4)
+    else:
+        fit = save.select(['constant', 'year', var]).reduce(ee.Reducer.linearRegression(numX=2, numY=1), 4)
+    slope = fit.select(['coefficients']).arrayProject([0]).arrayFlatten([['constant', 'trend']]).select('trend')
+    if mask:
+        slope = slope.updateMask(mask)
+    #rsq = get_rsq(save, fit, 'count', ee.List(['constant', 'year'])).rename('rsq')
+    
+    return slope
 
 def Rolling_LinearFit(collection, windowSize=17):
     """
@@ -726,7 +963,7 @@ def fit_multi_harmonic(collection, harmonics=3, bn=None):
     harmonic_coll = coll.map(addHarmonics(harmonicFrequencies))
     
     #The output of the regression reduction is a 4x1 array image.
-    harmonicTrend = harmonic_coll.select(independents.add(bn)).reduce(ee.Reducer.linearRegression(independents.length(), 1))
+    harmonicTrend = harmonic_coll.select(independents.add(bn)).reduce(ee.Reducer.linearRegression(independents.length(), 1), 4)
     
     #Turn the array image into a multi-band image of coefficients.
     harmonicTrendCoefficients = harmonicTrend.select('coefficients').arrayProject([0]).arrayFlatten([independents])
@@ -814,12 +1051,14 @@ def moving_harmonic(ic, start_year, end_year, bn=None, fit_period=3, harmonic_or
     
     output = []
     for year in range(start_year, end_year + 1):
-        #Get this list of years to use as a filter
         yearlist = create_yearlist(year, len_sides)
         filt = multi_year_data(yearlist)
         
         #Subset the data and fit a harmonic of given order
-        subset = ic.filter(filt)
+        subset = ee.ImageCollection(ic.filter(filt))
+        
+        #Detrend that subset
+        #subset_dt = detrend(subset)
         harmonic, phase, amplitude, rsq = fit_multi_harmonic(subset, harmonics=harmonic_order, bn=bn)
         
         #Retain only the given year
@@ -877,6 +1116,25 @@ def lt_monthly_mean(ic):
     l = ee.List([1,2,3,4,5,6,7,8,9,10,11,12])
     monthly_means = l.map(apply_filt)
     return monthly_means
+
+def match_time_res(in_ic, match_ic, nr_ts, timeframe, agg_fx):
+    '''
+    Create a new collection with time spacing based on a reference. Pools the previous 'nr_ts' 'timeframe's (e.g., 16 days)
+    with a given aggregator (e.g., ee.Reducer.mean()). Useful for summing up previous weeks of rain, for example.
+    '''
+    def create_new_composite(image):
+        #Get date from input imagecollection
+        ed = ee.Date(image.get('system:time_start'))
+        #Get previous date timestamp
+        sd = ed.advance(-1*nr_ts, timeframe)
+        #Filter the match image collection to those dates
+        subset_match_ic = match_ic.filterDate(sd, ed)
+        #Aggregate
+        agg = subset_match_ic.reduce(agg_fx)
+        return agg.set('system:time_start', image.get('system:time_start'))
+    
+    fix_ic = in_ic.map(create_new_composite)
+    return fix_ic
 
 def aggregate_to(collection, ds, de, timeframe='month', skip=1, agg_fx='sum', agg_var=None):
     '''
@@ -1085,12 +1343,12 @@ def windowed_difference_date(collection, ds, de, window_size, window_unit):
     
     return ee.ImageCollection(windif)
 
-def reduceFit(collection):
+def reduceFit(collection, time_step='month'):
     t = collection.get('system:time_start')
     bn = collection.first().bandNames().get(0)#.getInfo()[0]
     def createTimeBand(image):
         date = ee.Date(image.get('system:time_start'))
-        years = date.difference(ee.Date('1970-01-01'), 'month')
+        years = date.difference(ee.Date('1970-01-01'), time_step)
         return image.addBands(ee.Image(years).rename('t')).float().addBands(ee.Image.constant(1))
     
     c = collection.map(createTimeBand)
@@ -1494,6 +1752,12 @@ def otsu(histogram, fixed=False):
     return means.sort(bss).get([-1])
 
 #%% Data Import and Cleaning Functions
+def kNDVI(image):
+    ''' Compute kNDVI on a given image -- MUST BE THE ONLY BAND!'''
+    ndvi2 = image.pow(2)
+    kndvi = ndvi2.tan()
+    return kndvi.set('system:time_start', image.get('system:time_start'))
+
 ### GPM
 def mask_GPM(image):
     mask = image.gt(0.1)
@@ -1521,6 +1785,14 @@ def NDSI_L8_C2(image):
 def NDVI_L7(image):
     ndvi = image.normalizedDifference(['B4', 'B3']).rename('NDVI').set('system:time_start', image.get('system:time_start'))
     return image.addBands(ndvi)
+
+def MSAVI_L8(image):
+    msavi2 = image.select('B5').multiply(2).add(1).subtract(image.select('B5').multiply(2).add(1).pow(2)\
+                .subtract(image.select('B5').subtract(image.select('B4')).multiply(8)).sqrt())\
+                .divide(2)\
+                .set('system:time_start', image.get('system:time_start'))\
+                .rename('MSAVI2')
+    return image.addBands(msavi2)
 
 def NDVI_L8(image):
     ndvi = image.normalizedDifference(['B5', 'B4']).rename('NDVI').set('system:time_start', image.get('system:time_start'))
@@ -2334,7 +2606,7 @@ def apply_SG(collect, geom, window_size=7, imageAxis=0, bandAxis=1, order=3):
     return sg.filterMetadata('roi_min', 'not_equals', None).filterMetadata('roi_max', 'not_equals', None)
 
 #%% Conversion to Python Time Series
-def export_to_pandas(collection, clipper, aggregation_scale, med='median', save_std=True):
+def export_to_pandas(collection, clipper, aggregation_scale, med='median', save_std=True, mask=None):
     '''
     Takes an ImageCollection, an Earth Engine Geometry, and an aggregation scale (e.g., 30m for Landsat, 250m for MODIS, etc)
     
@@ -2348,6 +2620,8 @@ def export_to_pandas(collection, clipper, aggregation_scale, med='median', save_
     
     def createTS(image):
         date = image.get('system:time_start')
+        if mask:
+            image = image.updateMask(mask)
         if med == 'median':
             value = image.reduceRegion(ee.Reducer.median(), clipper, aggregation_scale)
         elif med == 'mean':
@@ -2386,8 +2660,10 @@ def export_to_pandas(collection, clipper, aggregation_scale, med='median', save_
         out_dates.append(pd.Timestamp(date))
     
     ser = pd.Series(out_vals, index=out_dates)
+    ser = ser.sort_index()
     if save_std:
         serstd = pd.Series(out_std, index=out_dates)
+        serstd = serstd.sort_index()
         return ser, serstd
     else:
         return ser
@@ -2427,29 +2703,6 @@ def percentile_export(collection, percentile, clipper, aggregation_scale=30, sav
         df.to_csv(save + '.csv', index=False)
         print(save)
     return ser
-
-#%%
-def deseason_data(ic, mode='complex', start_year=2001, end_year=2022, fit_period=3, harmonic_order=3):
-    #Detrend the data
-    detrend_ic = detrend(ic)
-    
-    #Get seasonality information
-    if mode == 'simple':
-        harmonic, _, _, _ = fit_multi_harmonic(detrend_ic, harmonic_order=harmonic_order)
-    elif mode == 'complex':
-        harmonic = moving_harmonic(detrend_ic, start_year, end_year, fit_period=fit_period, harmonic_order=harmonic_order)
-    
-    #Rename the detrended data as dt
-    dt = rename(detrend_ic, 'dt')
-    
-    #Get seasonality via harmonics
-    seasonality = rename(harmonic, 'seas')
-    
-    #Subtract the seasonal signal from the detrended signal to produce the final residuals
-    joint_vals = join_c(dt, seasonality, on='system:time_start')
-    deseasoned = simple_difference(joint_vals, 'dt', 'seas')
-    
-    return deseasoned
 
 #%% Short Example
 # minx2, maxx2 = 18, 20
