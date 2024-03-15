@@ -1785,7 +1785,7 @@ def otsu(histogram, fixed=False):
 def kNDVI(image):
     ''' Compute kNDVI on a given image -- MUST BE THE ONLY BAND!'''
     ndvi2 = image.pow(2)
-    kndvi = ndvi2.htan()
+    kndvi = ndvi2.tanh()
     return kndvi.set('system:time_start', image.get('system:time_start'))
 
 ### GPM
