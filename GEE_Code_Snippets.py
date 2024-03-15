@@ -158,7 +158,7 @@ def gee_geometry_from_shapely(geom, crs='epsg:4326'):
     Google Earth Engine Geometry.
     """
     from shapely.geometry import mapping
-    ty = geom.type
+    ty = geom.geom_type
     if ty == 'Polygon':
         return ee.Geometry.Polygon(ee.List(mapping(geom)['coordinates']), proj=crs, evenOdd=False)
     elif ty == 'Point':
@@ -180,6 +180,32 @@ def geopandas_to_earthengine(gdf, crs='epsg:4326'):
         feats.append(ee.Feature(ee_geom, atts))
     
     return ee.FeatureCollection(feats)
+
+def create_ee_fc(fid, buffer=0):
+    ''' Secondary (faster) way to create an earth engine feature collection '''
+    import json
+    import geopandas as gpd
+    gdf = gpd.read_file(fid)
+    geo_json = gdf.to_json()
+    ee_samp = ee.FeatureCollection(json.loads(geo_json))
+    if buffer:
+        def buff(f):
+            return f.buffer(buffer)
+        ee_samp = ee_samp.map(buff)
+    return ee_samp
+
+def create_ee_fc_split(fid, n_chunks=20):
+    ''' Create a list of earth engine feature collections based on chunking '''
+    import json
+    import geopandas as gpd
+    gdf = gpd.read_file(fid)
+    dflist = np.array_split(gdf, n_chunks)
+    out_fc_list = []
+    for df in dflist:
+        geo_json = df.to_json()
+        ee_samp = ee.FeatureCollection(json.loads(geo_json))
+        out_fc_list.append(ee_samp)
+    return out_fc_list
 
 def export_features(fc, filename, folder=None, output_format='CSV'):
     '''
@@ -1500,19 +1526,23 @@ def seasonal_composite(monthly, season):
     if season == 'DJF':
         for m in [12, 1, 2]:
             allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
-        filt = ee.Filter.Or(allfilts)
     if season == 'MAM':
         for m in [3, 4, 5]:
             allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
-        filt = ee.Filter.Or(allfilts)
     if season == 'JJA':
         for m in [6, 7, 8]:
             allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
-        filt = ee.Filter.Or(allfilts)
     if season == 'SON':
         for m in [9, 10, 11]:
             allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
-        filt = ee.Filter.Or(allfilts)    
+    if season == 'DJFMAM': 
+        for m in [12, 1, 2, 3, 4, 5]:
+            allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
+    if season == 'JJASON': 
+        for m in [6, 7, 8, 9, 10, 11]:
+            allfilts.append(ee.Filter.calendarRange(m, m, 'month'))
+    
+    filt = ee.Filter.Or(allfilts)    
     return monthly.filter(filt)
 
 def to_percent(collection, threshold_min, threshold_max):
@@ -1755,7 +1785,7 @@ def otsu(histogram, fixed=False):
 def kNDVI(image):
     ''' Compute kNDVI on a given image -- MUST BE THE ONLY BAND!'''
     ndvi2 = image.pow(2)
-    kndvi = ndvi2.tan()
+    kndvi = ndvi2.htan()
     return kndvi.set('system:time_start', image.get('system:time_start'))
 
 ### GPM
