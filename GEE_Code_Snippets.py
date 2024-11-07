@@ -7,10 +7,28 @@ Created on Tue Jul 14 11:16:43 2020
 
 import ee
 ee.Initialize()
-import numpy as np
+import numpy as np, pandas as pd
 import os
 
 #%% General Helper Functions
+def count_tasks_running(p=True):
+    '''
+    Get a list of the running tasks, return the full dataframe and a list of the running task names.
+    '''
+    tasks = ee.data.listOperations()
+    df = pd.DataFrame(tasks)
+    running = df.loc[df.done != True]
+    if p:
+        print('Pending/Running:', len(running))
+    
+    #Get the running task names
+    names = running.metadata
+    running_ids = []
+    for n in names:
+        job_id = n['description']
+        running_ids.append(job_id)
+    return df, running_ids
+
 def run_export(image, crs, filename, scale, region, folder=None, maxPixels=1e12, cloud_optimized=True):
     '''
     Runs an export function on GEE servers
@@ -41,7 +59,7 @@ def export_timeseries_todrive(collection, filename, scale, region, folder=None, 
     task.start()
         
 def export_collection(collection, region, prefix, crs=None, scale=100, start_image=0, \
-                      max_images=None, folder=None, namelist=None):
+                      max_images=None, folder=None, namelist=None, gdrive=None):
     '''
     Exports all images within an image collection for a given region. All files named by a prefix (given)
     and their image date (formatted YYYYMMDD). 
@@ -52,6 +70,7 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
     start_image: where to start in the list of images (e.g., if you need to break your job up into pieces)
     max_images: number of images to export (e.g., maximum)
     folder: if you want to store all images in a separate folder in your GDrive
+    gdrive: local folder mount of gdrive, to check for existing files
     '''
     if not crs:
         crs = collection.first().projection()
@@ -93,15 +112,27 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
                     date = image.get('system:time_start')
                     date_name = ee.Date(date).format('YYYYMMdd').getInfo()
                 output_name = prefix + '_' + date_name + '_' + str(scale) + 'm'
-                run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
-                print('Started export for image ' + str(i) + '(' + date_name + ')')
+                if gdrive:
+                    if folder:
+                        savename = gdrive + folder + '/' + output_name + '.tif'
+                    else:
+                        savename = gdrive + output_name + '.tif'
+                    if not os.path.exists(savename):
+                        run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
+                        print('Started export for image ' + str(i) + '(' + date_name + ')')
+                    else:
+                        print(savename, 'Exists!')
+                else:
+                    run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
+                    print('Started export for image ' + str(i) + '(' + date_name + ')')
        
-def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny=-80, maxy=80, step=20, gdrive=None, folder=None, **kwaargs):
+def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny=-80, maxy=80, step=20, gdrive=None, folder=None, max_img=None, **kwaargs):
     '''
     Split a large (e.g., global) job into smaller pieces. Can help with memory issues/speed of processing.
     '''
     if not crs:
         crs = ee.Projection('EPSG:4326')
+    ct=0
     for i in range(minx,maxx,step):
         for j in range(miny,maxy,step):
             imax = i + step
@@ -120,10 +151,21 @@ def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny
                 else:
                     print('Starting', name)
                     run_export(image, crs=crs, filename=name, region=roi, scale=scale, folder=folder, **kwaargs)
+                    ct += 1
+                    if max_img:
+                        if ct >= max_img:
+                            break
             else:
                 print('Starting', name)
                 run_export(image, crs=crs, filename=name, region=roi, scale=scale, folder=folder, **kwaargs)
-        
+                ct += 1
+                if max_img:
+                    if ct >= max_img:
+                        break
+        if max_img:
+            if ct >= max_img:
+                break
+                
 def build_collection_from_search(ic, searchranges, var, agg_fx):
     '''
     Given a set of date ranges (e.g., [start_date, end_date]), create an image collection that is 
