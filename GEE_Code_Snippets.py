@@ -29,10 +29,13 @@ def count_tasks_running(p=True):
         running_ids.append(job_id)
     return df, running_ids
 
-def run_export(image, crs, filename, scale, region, folder=None, maxPixels=1e12, cloud_optimized=True):
+def run_export(image, crs, filename, scale, region, folder=None, maxPixels=1e12, cloud_optimized=True, clip=None):
     '''
     Runs an export function on GEE servers
     '''
+    if clip:
+        #Force a tight clip rather than a bounding box
+        image = image.clip(region)
     task_config = {'fileNamePrefix': filename,'crs': crs,'scale': scale,'maxPixels': maxPixels, 'fileFormat': 'GeoTIFF', 'formatOptions': {'cloudOptimized': cloud_optimized}, 'region': region,}
     if folder:
         task_config['folder'] = folder
@@ -47,7 +50,7 @@ def export_timeseries_todrive(collection, filename, scale, region, folder=None, 
     def createTS(image):
         date = image.get('system:time_start')
         value = image.reduceRegion(agg_fx, region, scale)
-        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'val': value})
+        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format(), 'val': value})
         return ft
     
     TS = collection.filterBounds(region).map(createTS)
@@ -59,7 +62,7 @@ def export_timeseries_todrive(collection, filename, scale, region, folder=None, 
     task.start()
         
 def export_collection(collection, region, prefix, crs=None, scale=100, start_image=0, \
-                      max_images=None, folder=None, namelist=None, gdrive=None):
+                      max_images=None, folder=None, namelist=None, gdrive=None, clip=None):
     '''
     Exports all images within an image collection for a given region. All files named by a prefix (given)
     and their image date (formatted YYYYMMDD). 
@@ -71,6 +74,7 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
     max_images: number of images to export (e.g., maximum)
     folder: if you want to store all images in a separate folder in your GDrive
     gdrive: local folder mount of gdrive, to check for existing files
+    clip: force tight clipping rather than bounding box clipping (default)
     '''
     if not crs:
         crs = collection.first().projection()
@@ -92,7 +96,7 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
         for i, name in enumerate(namelist):
             image = ee.Image(image_list.get(i))
             output_name = prefix + '_' + name + '_' + str(scale) + 'm'
-            run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
+            run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder, clip=clip)
             print('Started export for image ' + str(i) + ' (' + name + ')')
             
     else:
@@ -118,15 +122,16 @@ def export_collection(collection, region, prefix, crs=None, scale=100, start_ima
                     else:
                         savename = gdrive + output_name + '.tif'
                     if not os.path.exists(savename):
-                        run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
+                        run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder, clip=clip)
                         print('Started export for image ' + str(i) + '(' + date_name + ')')
                     else:
                         print(savename, 'Exists!')
                 else:
-                    run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder)
+                    run_export(image, crs=crs, filename=output_name, scale=scale, region=region, folder=folder,clip=clip)
                     print('Started export for image ' + str(i) + '(' + date_name + ')')
        
-def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny=-80, maxy=80, step=20, gdrive=None, folder=None, max_img=None, **kwaargs):
+def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny=-80, maxy=80, step=20, \
+                 gdrive=None, folder=None, max_img=None, clip=None, **kwaargs):
     '''
     Split a large (e.g., global) job into smaller pieces. Can help with memory issues/speed of processing.
     '''
@@ -150,14 +155,14 @@ def split_export(image, namebase, crs=None, scale=500, minx=-180, maxx=180, miny
                     pass
                 else:
                     print('Starting', name)
-                    run_export(image, crs=crs, filename=name, region=roi, scale=scale, folder=folder, **kwaargs)
+                    run_export(image, crs=crs, filename=name, region=roi, scale=scale, folder=folder, clip=clip, **kwaargs)
                     ct += 1
                     if max_img:
                         if ct >= max_img:
                             break
             else:
                 print('Starting', name)
-                run_export(image, crs=crs, filename=name, region=roi, scale=scale, folder=folder, **kwaargs)
+                run_export(image, crs=crs, filename=name, region=roi, scale=scale, folder=folder, clip=clip, **kwaargs)
                 ct += 1
                 if max_img:
                     if ct >= max_img:
@@ -458,7 +463,7 @@ def get_utm_from_image(image):
     #else:
     #    epsg_code = ee.String('327').cat(utm_band)
     
-    #NOTE: THIS DOESNT SUPPORT POLAR COORDINATE SYSTEMS RIGHT NOW
+    #NOTE: THIS DOESNT SUPPORT POLAR COORDINATE SYSTEMS 
     epsg_code = ee.Algorithms.If(lat.gte(0), ee.String('326').cat(utm_band), ee.String('327').cat(utm_band))
     
     proj = ee.Projection(ee.String('epsg:').cat(ee.String(epsg_code)))
@@ -2702,9 +2707,11 @@ def export_to_pandas(collection, clipper, aggregation_scale, med='median', save_
             value = image.reduceRegion(med, clipper, aggregation_scale)
         if save_std:
             std = image.reduceRegion(ee.Reducer.stdDev(), clipper, aggregation_scale)
-            ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mn': value, 'STD': std})
+            #ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mn': value, 'STD': std})
+            ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format(), 'Mn': value, 'STD': std})
         else:
-            ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mn': value})
+            #ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'Mn': value})
+            ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format(), 'Mn': value})
         return ft
     
     TS = collection.filterBounds(clipper).map(createTS)
@@ -2750,7 +2757,7 @@ def percentile_export(collection, percentile, clipper, aggregation_scale=30, sav
     def createTS(image):
         date = image.get('system:time_start')
         value = image.reduceRegion(ee.Reducer.percentile([percentile]), clipper, aggregation_scale)
-        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format('Y/M/d'), 'PCT': value})
+        ft = ee.Feature(None, {'system:time_start': date, 'date': ee.Date(date).format(), 'PCT': value})
         return ft
     
     TS = collection.filterBounds(clipper).map(createTS)
@@ -2775,22 +2782,3 @@ def percentile_export(collection, percentile, clipper, aggregation_scale=30, sav
         df.to_csv(save + '.csv', index=False)
         print(save)
     return ser
-
-#%% Short Example
-# minx2, maxx2 = 18, 20
-# miny2, maxy2 = -20, -18
-# from shapely.geometry import Polygon
-# geom = Polygon([[minx2, maxy2], [maxx2, maxy2], [maxx2, miny2], [minx2, miny2]])
-
-# search_area = gee_geometry_from_shapely(geom)
-
-# L8 = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR").filter(ee.Filter.date('2013-01-01', '2020-01-01'))\
-#     .filterBounds(search_area)\
-#     .filter(ee.Filter.lt('CLOUD_COVER', 15))\
-#     .map(maskL8sr)\
-#     .sort('system:time_start')
-
-# NDVI = L8.map(NDVI_L8).select('NDVI')
-
-# harmonic, phase, amplitude, rsq = fit_multi_harmonic(detrend(NDVI), 5)
-# run_export(phase, 'epsg:4326', 'Landsat8_HarmonicPhase', scale=30, region=search_area, maxPixels=1e12)
